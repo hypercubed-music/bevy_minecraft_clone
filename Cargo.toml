@@ -1,0 +1,23 @@
+[package]
+name = "bevy_blockgame"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bevy = "0.5.0"
+ndarray = "0.15.0"
+nalgebra = "0.29.0"
+noise = "0.7"
+itertools = "0.10"
+bevy_prototype_character_controller = { git = "https://github.com/superdump/bevy_prototype_character_controller" }
+rand = "0.8"
+bevy_rapier3d = "0.11"
+bevy_mod_raycast = "0.2"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

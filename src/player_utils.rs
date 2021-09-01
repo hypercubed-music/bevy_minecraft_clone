@@ -22,6 +22,11 @@ pub struct CharacterSettings {
     pub focal_point: Vec3,
 }
 
+// in the future this will have info like crouching, fall distance
+pub struct CharacterState {
+    pub last_ground_point: f32
+}
+
 pub struct MyRaycastSet;
 
 impl Default for CharacterSettings {
@@ -72,7 +77,7 @@ pub fn spawn_character(
     let body = commands
         .spawn_bundle((
             GlobalTransform::identity(),
-            Transform::from_translation(Vec3::new(0.5,64.0,0.5)),
+            Transform::from_translation(Vec3::new(0.5,80.0,0.5)),
             CharacterController{
                 walk_speed : 7.0,
                 run_speed : 10.0,
@@ -82,6 +87,9 @@ pub fn spawn_character(
             FakeKinematicRigidBody,
             Mass::new(80.0),
             BodyTag,
+            CharacterState {
+                last_ground_point : -9999.9
+            }
         ))
         .id();
     let yaw = commands
@@ -146,7 +154,7 @@ pub fn controller_to_kinematic(
     query_pipeline: Res<QueryPipeline>, 
     collider_query: QueryPipelineColliderComponentsQuery,
     mut query: Query<
-        (&mut Transform, &mut CharacterController),
+        (&mut Transform, &mut CharacterController, &mut CharacterState),
         (With<BodyTag>, With<FakeKinematicRigidBody>),
     >,
 ) {
@@ -154,7 +162,7 @@ pub fn controller_to_kinematic(
     let solid = true;
     let groups = InteractionGroups::all();
     let filter = None;
-    for (mut transform, mut controller) in query.iter_mut() {
+    for (mut transform, mut controller, mut state) in query.iter_mut() {
         let collider_set = QueryPipelineColliderComponentsSet(&collider_query);
         for translation in translations.iter() {
             let xz_transform = Vec3::new((**translation).x, 0.0, (**translation).z);
@@ -165,18 +173,16 @@ pub fn controller_to_kinematic(
             let head_ray = Ray::new((transform.translation + (Vec3::Y*1.1)).into(), xz_transform.normalize().into());
             
             // Only move if the rays dont hit
-            if let None = query_pipeline.cast_ray(
-                &collider_set, &head_ray, 0.5, solid, groups, filter) {
-                if let None = query_pipeline.cast_ray(
-                    &collider_set, &feet_ray, 0.5, true, InteractionGroups::all(), None) {
+            if query_pipeline.cast_ray(
+                &collider_set, &head_ray, 0.5, solid, groups, filter).is_none() {
+                if query_pipeline.cast_ray(
+                    &collider_set, &feet_ray, 0.5, true, InteractionGroups::all(), None).is_none() {
                     transform.translation += xz_transform;
                 } else {
-                    println!("foot ray hit");
                     controller.velocity.x = 0.0;
                     controller.velocity.z = 0.0;
                 }
             } else {
-                println!("head ray hit");
                 controller.velocity.x = 0.0;
                 controller.velocity.z = 0.0;
             }
@@ -184,26 +190,23 @@ pub fn controller_to_kinematic(
             let gravity_ray = Ray::new((transform.translation).into(), (-Vec3::Y).into());
             
             if let Some((_,toi)) = query_pipeline.cast_ray(
-                &collider_set, &gravity_ray, 50.0, solid, groups, filter) {
-                    let floor_pos = gravity_ray.point_at(toi);
-                    if floor_pos.y + 0.5 < transform.translation.y {
-                        // fall as normal
-                        controller.jumping = true;
-                        transform.translation += y_transform;
-                    } else {
-                        if y_transform.y > 0.0 {
-                            // jump
-                            transform.translation += y_transform;
-                            controller.jumping = true;
-                        } else if y_transform.y < 0.0 {
-                            // stop falling
-                            controller.jumping = false;
-                            transform.translation.y = floor_pos.y + 0.5;
-                        }
+                &collider_set, &gravity_ray, 100.0, solid, groups, filter) {
+                    if (gravity_ray.point_at(toi).y - state.last_ground_point).abs() > f32::EPSILON {
+                        state.last_ground_point = gravity_ray.point_at(toi).y;
                     }
-            } else {
+            }
+            if state.last_ground_point + 0.5 < transform.translation.y {
+                // fall as normal
                 controller.jumping = true;
                 transform.translation += y_transform;
+            } else if y_transform.y > 0.0 {
+                // jump
+                transform.translation += y_transform;
+                controller.jumping = true;
+            } else if y_transform.y < 0.0 {
+                // stop falling
+                controller.jumping = false;
+                transform.translation.y = state.last_ground_point + 0.5;
             }
         }
     }

@@ -1,15 +1,13 @@
 
-use nalgebra::{Vector2, Vector3, Point};
-use ndarray::*;
-use bevy::{prelude::*,
-            render::pipeline::PrimitiveTopology,
-            render::mesh::Indices};
+use bevy_rapier3d::na::{Vector2, Vector3, Point};
+use bevy::{render::pipeline::PrimitiveTopology,
+            render::mesh::Indices, render::mesh::Mesh};
 use bevy_rapier3d::prelude::*;
 use std::time::{Duration, Instant};
 //use nalgebra::base::{Vector2, Vector3};
 
-const CHUNK_WIDTH : i32 = 16;
-const CHUNK_HEIGHT : i32 = 16;
+const CHUNK_WIDTH : i32 = 32;
+const CHUNK_WIDTH_U : usize = 32;
 
 const TEXIMG_WIDTH : f32 = 32.0;
 const TEX_OFFSETS : [[[f32;2];6];8] = [[[0.0,0.0],[0.0,0.0],[0.0,0.0],[0.0,0.0],[0.0,0.0],[0.0,0.0],], //air?
@@ -43,7 +41,7 @@ pub enum ChunkState {
 pub struct Chunk {
     pub position : Vector3<i32>,
     //blockIDs : Array3::<u8>,
-    blockIDs : [[[u8; 18]; 18]; 18],
+    pub blockIDs : [[[u8; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2],
 }
 
 impl Chunk {
@@ -51,8 +49,8 @@ impl Chunk {
     pub fn new(position : [i32;3]) -> Self {
         Chunk {
             position : Vector3::new(position[0], position[1], position[2]),
-            //blockIDs : Array3::<u8>::zeros(((CHUNK_WIDTH+2) as usize, (CHUNK_HEIGHT+2) as usize, (CHUNK_WIDTH+2) as usize))
-            blockIDs : [[[0; 18]; 18]; 18],
+            //blockIDs : Array3::<u8>::zeros(((CHUNK_WIDTH+2) as usize, (CHUNK_WIDTH+2) as usize, (CHUNK_WIDTH+2) as usize))
+            blockIDs : [[[0; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2],
         }
     }
 
@@ -96,7 +94,7 @@ impl Chunk {
         }
     }
 
-    pub fn set_blocks(&mut self, blocks : [[[u8; 18]; 18]; 18]) -> &Self {
+    pub fn set_blocks(&mut self, blocks : [[[u8; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]) -> &Self {
         self.blockIDs = blocks;
         self
     }
@@ -104,7 +102,7 @@ impl Chunk {
     fn buildMesh(&mut self, faces : (Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>))
         -> (Vec<Vector3<f32>>, Vec<Vector2<f32>>, Vec<[f32;3]>) {
         let offset = Vector3::new((self.position.x * (CHUNK_WIDTH)) as f32, 
-            (self.position.y * (CHUNK_HEIGHT)) as f32,
+            (self.position.y * (CHUNK_WIDTH)) as f32,
             (self.position.z * (CHUNK_WIDTH)) as f32);
         let mut verts = vec![];
         let mut uvs = vec![];
@@ -184,7 +182,7 @@ impl Chunk {
                         continue;
                     }
                     if ix > 0 && ix < (CHUNK_WIDTH + 1) as usize
-                        && iy > 0 && iy < (CHUNK_HEIGHT + 1) as usize
+                        && iy > 0 && iy < (CHUNK_WIDTH + 1) as usize
                         && iz > 0 && iz < (CHUNK_WIDTH + 1) as usize {
                         if self.blockIDs[ix - 1][iy][iz] == 0 {
                             right.push(Vector3::new(iix, iiy, iiz));
@@ -211,7 +209,7 @@ impl Chunk {
         (right, left, top, bottom, front, back)
     }
 
-    pub fn setBlock(&mut self, pos:[i32;3], id:u8) -> [[[u8;18];18];18] {
+    pub fn setBlock(&mut self, pos:[i32;3], id:u8) -> [[[u8;CHUNK_WIDTH_U + 2];CHUNK_WIDTH_U + 2];CHUNK_WIDTH_U + 2] {
         self.blockIDs[pos[0] as usize][pos[1] as usize][pos[2] as usize] = id;
         self.blockIDs
     } 

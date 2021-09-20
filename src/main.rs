@@ -1,57 +1,95 @@
 use bevy::{
         prelude::*,
-        pbr::AmbientLight};
+        render::{
+            pipeline::{FrontFace, PipelineDescriptor, RenderPipeline},
+            shader::{shader_defs_system,ShaderStage, ShaderStages},
+            render_graph::{base, RenderGraph, RenderResourcesNode},
+        },
+        pbr::AmbientLight,
+        tasks::{AsyncComputeTaskPool, Task},};
 use bevy_prototype_character_controller::{
     controller::{
         BodyTag,controller_to_pitch, controller_to_yaw
     },
 };
+use bevy_frustum_culling::*;
 use std::time::{Instant};
 use bevy_rapier3d::prelude::*;
 mod player_utils;
 use player_utils::{build_app, controller_to_kinematic, CharacterSettings, FakeKinematicRigidBody, MyRaycastSet, BlockHighlight};
 use itertools::*;
 use bevy_mod_raycast::{RayCastMesh, RayCastSource};
-use std::thread;
 use rand::distributions::{Distribution, Uniform};
+use bevy_physical_sky::{
+    PhysicalSkyMaterial, PhysicalSkyPlugin, SolarPosition,
+    PHYSICAL_SKY_FRAGMENT_SHADER, PHYSICAL_SKY_PASS_TIME_SYSTEM, PHYSICAL_SKY_VERTEX_SHADER,PHYSICAL_SKY_SETUP_SYSTEM, Utc, TimeZone
+};
+use futures_lite::future;
+use rustc_hash::FxHashMap;
 
+mod shaders;
+use shaders::{vert_shader, frag_shader};
 mod chunk;
 mod worldgen;
 
-struct Game {
-    chunkPos : Vec<[i32;3]>,
-    chunks : Vec<Option<Entity>>,
-    chunk_colliders : Vec<Option<Entity>>,
-    chunk_states : Vec<chunk::ChunkState>,
-    chunk_blocks : Vec<[[[u8; 18]; 18]; 18]>,
-    seed : u32
-}
+const CHUNK_WIDTH : i32 = 32;
+const CHUNK_WIDTH_U : usize = 32;
 
 const RENDER_DISTANCE : i32 = 5;
 const RENDER_DISTANCE_VERTICAL : i32 = 3;
+
+type BlockArray = ([[[u8; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]);
+
+struct ChunkData {
+    collider : Option<Entity>, 
+    entity : Option<Entity>, 
+    state : chunk::ChunkState, 
+    blocks : chunk::Chunk,
+    generator : worldgen::ChunkGenerator
+}
+
+struct Game {
+    //chunks : Vec<ChunkData>,
+    //current_chunks : Vec<[i32;3]>,
+    chunks : FxHashMap<[i32;3], ChunkData>,
+    block_change_queue : Vec<([i32;3], [i32;3], u8)>,
+    seed: u32,
+}
 
 fn main() {
     let mut app = App::build();
     build_app(&mut app);
     app.add_plugin(RapierPhysicsPlugin::<NoUserData>::default())
-        //.add_plugin(PickingPlugin)
-        //.add_plugin(InteractablePickingPlugin)
-        //.insert_resource(Msaa { samples: 4 })
+        .add_plugin(BoundingVolumePlugin::<obb::Obb>::default())
+        .add_plugin(FrustumCullingPlugin::<obb::Obb>::default())
         .insert_resource(CharacterSettings {
             focal_point: -Vec3::Z,     // Relative to head
             follow_offset: Vec3::ZERO, // Relative to head
             ..Default::default()
         })
-        .insert_resource(ClearColor(Color::rgb(0.5294, 0.8078, 0.9216)))
         .insert_resource(Game {
-            chunkPos : vec![],
-            chunks : vec![],
-            chunk_colliders : vec![],
-            chunk_states : vec![],
-            chunk_blocks : vec![],
-            seed : Uniform::from(0..99999).sample(&mut rand::thread_rng())
+            chunks: FxHashMap::default(),
+            block_change_queue : Vec::new(),
+            seed : Uniform::from(0..99999).sample(&mut rand::thread_rng()),
         })
-        .add_startup_system(setup.system())
+        // Sky
+        .insert_resource(SolarPosition {
+            // Stockholm
+            latitude: 0.0,
+            longitude: 0.0,
+            // one day per 8 minutes of real time
+            simulation_seconds_per_second: 24.0 * 60.0 * 60.0 / (20.0 * 60.0),
+            now: Utc.ymd(2021, 03, 01).and_hms(13, 0, 0),
+            ..Default::default()
+        })
+        .add_plugin(PhysicalSkyPlugin)
+        .add_system(
+            update_sun_light_position
+                .system()
+                .label("update_sun_light_position")
+                .after(PHYSICAL_SKY_PASS_TIME_SYSTEM),
+        )
+        .add_startup_system(setup.system().after(PHYSICAL_SKY_SETUP_SYSTEM))
         .add_system(controller_to_kinematic.system())
         .add_system(controller_to_yaw.system())
         .add_system(controller_to_pitch.system())
@@ -59,8 +97,10 @@ fn main() {
         //.add_system(chunk_render_system.system())
         .add_system(chunk_instancing_system.system())
         .add_system(chunk_generate_system.system())
+        .add_system(handle_tasks.system())
         .add_system(chunk_despawn_system.system())
-        .add_system(handle_mouse.system())
+        .add_system(handle_mouse.system().label("mouse"))
+        .add_system(updateChunks.system().after("mouse"))
         .run();
 }
 
@@ -82,17 +122,32 @@ fn cursor_grab_system(
     }
 }
 
-/// set up a simple 3D scene
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut c_materials: ResMut<Assets<ColorMaterial>>,
+    mut sky_materials: ResMut<Assets<PhysicalSkyMaterial>>,
+    mut pipelines: ResMut<Assets<PipelineDescriptor>>,
+    mut shaders: ResMut<Assets<Shader>>,
     mut ambient_light: ResMut<AmbientLight>,
 ) {
-
     ambient_light.color = Color::WHITE;
-    ambient_light.brightness = 0.5;
+    ambient_light.brightness = 0.15;
+    // Create a new shader pipeline
+    let mut pipeline_descriptor = PipelineDescriptor::default_config(ShaderStages {
+        vertex: shaders.add(Shader::from_glsl(
+            ShaderStage::Vertex,
+            PHYSICAL_SKY_VERTEX_SHADER,
+        )),
+        fragment: Some(shaders.add(Shader::from_glsl(
+            ShaderStage::Fragment,
+            PHYSICAL_SKY_FRAGMENT_SHADER,
+        ))),
+    });
+    // Reverse the winding so we can see the faces from the inside
+    pipeline_descriptor.primitive.front_face = FrontFace::Cw;
+    let pipeline = pipelines.add(pipeline_descriptor);
 
     commands.spawn_bundle(UiCameraBundle::default());
 
@@ -109,7 +164,7 @@ fn setup(
                 },
                 ..Default::default()
             },
-            material: c_materials.add(Color::rgb(1.0,0.0,0.0).into()),
+            material: c_materials.add(bevy::prelude::Color::rgb(1.0,0.0,0.0).into()),
             ..Default::default()
         });
 
@@ -127,6 +182,61 @@ fn setup(
         },
         ..Default::default()
     }).insert(BlockHighlight);
+
+    //sun
+    commands.spawn_bundle(LightBundle {
+        transform: Transform::from_translation(Vec3::new(
+            1000.5,
+            592.0,
+            3200.5,
+        )),
+        light: Light {
+            color: Color::ANTIQUE_WHITE,
+            intensity: 90000000.0,
+            depth: 0.1..9000000.0,
+            range: 9000000.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    // Create a new material
+    let material = sky_materials.add(PhysicalSkyMaterial::red_sunset(true));
+
+    // Sky box cube
+    commands
+        .spawn_bundle(MeshBundle {
+            mesh: meshes.add(Mesh::from(bevy::prelude::shape::Icosphere {
+                radius: 1000.0,
+                subdivisions: 5,
+            })),
+            render_pipelines: RenderPipelines::from_pipelines(vec![RenderPipeline::new(pipeline)]),
+            transform: Transform::from_xyz(0.5, 80.0, 0.5),
+            ..Default::default()
+        })
+        .insert(material);
+}
+
+fn update_sun_light_position(
+    solar_position: Res<SolarPosition>,
+    mut query: Query<(&mut Transform, &mut Light), With<Light>>,
+) {
+    let (azimuth, inclination) = solar_position.get_azimuth_inclination();
+    let (azimuth_radians, inclination_radians) = (
+        (azimuth.to_radians() - std::f64::consts::PI) as f32,
+        inclination.to_radians() as f32,
+    );
+    let translation = Vec3::new(
+        azimuth_radians.cos(),
+        azimuth_radians.sin() * inclination_radians.sin(),
+        azimuth_radians.sin() * inclination_radians.cos(),
+    )
+    .normalize()
+        * 4500.0;
+    for (mut transform, mut light) in query.iter_mut() {
+        *transform = Transform::from_translation(translation);
+        (*light).intensity = if translation.y > 0.0 {90000000.0} else {0.0};
+    }
 }
 
 fn chunk_instancing_system (mut transform_query: Query<
@@ -134,12 +244,14 @@ fn chunk_instancing_system (mut transform_query: Query<
     (With<BodyTag>, With<FakeKinematicRigidBody>),
 >,
 mut game_state: ResMut<Game>,) {
+    let seed = game_state.seed.clone();
     // INstances a chunk
     let transform = transform_query.single_mut().expect("THERE CAN ONLY BE ONE");
     // generate possible chunk positions
-    let p_pos : [i32;3] = [(transform.translation.x/16.0) as i32,
-        (transform.translation.y/16.0) as i32,
-        (transform.translation.z/16.0) as i32,];
+    let float_chunk_width = CHUNK_WIDTH as f32;
+    let p_pos : [i32;3] = [(transform.translation.x/float_chunk_width) as i32,
+        (transform.translation.y/float_chunk_width) as i32,
+        (transform.translation.z/float_chunk_width) as i32,];
     let mut chunk_pos : Vec<[i32;3]> = vec![];
     for (x, y, z) in iproduct!(p_pos[0]-RENDER_DISTANCE..p_pos[0]+RENDER_DISTANCE, 
         p_pos[1]-RENDER_DISTANCE_VERTICAL..p_pos[1]+RENDER_DISTANCE_VERTICAL, 
@@ -151,13 +263,14 @@ mut game_state: ResMut<Game>,) {
         .partial_cmp(&((b[0]-p_pos[0]).abs() + (b[1]-p_pos[0]).abs() + (b[2]-p_pos[2]).abs())).unwrap());
     // Check for chunks to add
     for pos in chunk_pos.iter() {
-        if !game_state.chunkPos.iter().any(|i| i==pos) {
-            game_state.chunkPos.push(*pos);
-            game_state.chunks.push(None);
-            game_state.chunk_colliders.push(None);
-            game_state.chunk_blocks.push([[[0;18];18];18]);
-            game_state.chunk_states.push(chunk::ChunkState::NoGen);
-            break;
+        if !game_state.chunks.keys().any(|i| i==pos) {
+            game_state.chunks.insert(*pos, ChunkData {
+                entity : None, 
+                collider : None, 
+                state : chunk::ChunkState::NoGen,
+                blocks : chunk::Chunk::new(*pos), 
+                //generator : worldgen::ChunkGenerator::new(*pos, seed, 0)});
+                generator : worldgen::ChunkGenerator::new_dont_build(*pos, seed, 3)});
         }
     }
 }
@@ -166,61 +279,129 @@ fn chunk_generate_system( mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
-    mut game_state: ResMut<Game>,) {
+    mut game_state: ResMut<Game>,
+    thread_pool: Res<AsyncComputeTaskPool>,
+    mut transform_query: Query<
+    &mut Transform,
+    (With<BodyTag>, With<FakeKinematicRigidBody>),>,
+) {
     // Builds chunks
-    let mut maxSteps = 3;
-    for idx in 0..game_state.chunks.len() {
-        // chunk hasn't been rendered yet, probably needs to be generated
-        let pos = game_state.chunkPos[idx];
-        if game_state.chunk_states[idx] == chunk::ChunkState::NoGen {
-            // Generate ground
-            if let Some(new_gen) = worldgen::ChunkGenerator::generate(pos, game_state.seed) {
-                game_state.chunk_blocks[idx] = new_gen;
-            }
-            game_state.chunk_states[idx] = chunk::ChunkState::GroundGen;
-            maxSteps -= 1;
-            if maxSteps==0 {
-                break;
-            }
-        } else if game_state.chunk_states[idx] == chunk::ChunkState::GroundGen {
-            if let Some(new_gen) = worldgen::ChunkGenerator::generateStructs(pos, game_state.seed, game_state.chunk_blocks[idx]) {
-                game_state.chunk_blocks[idx] = new_gen;
-            }
-            game_state.chunk_states[idx] = chunk::ChunkState::StructGen;
-            maxSteps -= 1;
-            if maxSteps==0 {
-                break;
-            }
-        } else if game_state.chunk_states[idx] == chunk::ChunkState::StructGen {
-            let mut new_chunk = chunk::Chunk::new(pos);
-            new_chunk.set_blocks(game_state.chunk_blocks[idx]);
-            // chunk can be non-empty but still have data
-            if let Some((new_mesh, new_collider)) = new_chunk.render() {
-                let texture_handle = asset_server.load("atlas.png");
-                let material_handle = materials.add(StandardMaterial {
-                    //base_color: Color::rgb(rand::thread_rng().gen(), rand::thread_rng().gen(), rand::thread_rng().gen()),
-                    base_color_texture: Some(texture_handle.clone()),
-                    unlit: true,
-                    ..Default::default()
+    let mut maxSteps = 10;
+    let float_chunk_width = CHUNK_WIDTH as f32;
+    let transform = transform_query.single_mut().expect("THERE CAN ONLY BE ONE");
+    let p_pos : [i32;3] = [(transform.translation.x/float_chunk_width) as i32,
+        (transform.translation.y/float_chunk_width) as i32,
+        (transform.translation.z/float_chunk_width) as i32,];
+    let mut chunk_pos : Vec<[i32;3]> = vec![];
+    for (x, y, z) in iproduct!(p_pos[0]-RENDER_DISTANCE..p_pos[0]+RENDER_DISTANCE, 
+        p_pos[1]-RENDER_DISTANCE_VERTICAL..p_pos[1]+RENDER_DISTANCE_VERTICAL, 
+        p_pos[2]-RENDER_DISTANCE..p_pos[2]+RENDER_DISTANCE) {
+            chunk_pos.push([x, y, z]);
+    }
+    chunk_pos.sort_by(|a, b| 
+        ((a[0]-p_pos[0]).abs() + (a[1]-p_pos[0]).abs() + (a[2]-p_pos[2]).abs())
+        .partial_cmp(&((b[0]-p_pos[0]).abs() + (b[1]-p_pos[0]).abs() + (b[2]-p_pos[2]).abs())).unwrap());
+
+    for pos in chunk_pos {
+        let seed = game_state.seed.clone();
+        if game_state.chunks.keys().any(|&x| x == pos) {
+            let chunk = match game_state.chunks.get_mut(&pos) {
+                Some(val) => val,
+                None => {continue;}
+            };
+            if chunk.state == chunk::ChunkState::NoGen {
+                let mut gen_clone = chunk.generator.clone();
+                let gen_task = thread_pool.spawn(async move {
+                    gen_clone.build_maps();
+                    if let Some(new_gen) = gen_clone.generate(pos, seed) {
+                        (gen_clone.generateStructs(pos, seed, new_gen), pos)
+                    } else {
+                        (gen_clone.generateStructs(pos, seed, gen_clone.blankBlocks()), pos)
+                    }
                 });
-                let chunk_id = commands.spawn_bundle(PbrBundle {
-                    mesh: meshes.add(new_mesh),
-                    material: material_handle,
-                    ..Default::default()
-                })
-                .insert(RayCastMesh::<MyRaycastSet>::default())
-                .insert(new_chunk).id();
-                let chunk_collider_id = commands.spawn_bundle(new_collider).id();
-                game_state.chunks[idx] = Some(chunk_id);
-                game_state.chunk_colliders[idx] = Some(chunk_collider_id);
-            } else {
-                game_state.chunks[idx] = None;
-                game_state.chunk_colliders[idx] = None;
+                commands.spawn().insert(gen_task);
+            } else if chunk.state == chunk::ChunkState::GroundGen {
+            } else if chunk.state == chunk::ChunkState::StructGen {
+                if let Some((new_mesh, new_collider)) = chunk.blocks.render() {
+                    let texture_handle = asset_server.load("atlas.png");
+                    let material_handle = materials.add(StandardMaterial {
+                        base_color_texture: Some(texture_handle.clone()),
+                        metallic: 0.0,
+                        roughness: 1.0,
+                        reflectance: 0.0,
+                        ..Default::default()
+                    });
+                    let chunk_id = commands.spawn_bundle(PbrBundle {
+                        mesh: meshes.add(new_mesh),
+                        material: material_handle,
+                        ..Default::default()
+                    })
+                    .insert(obb::Obb::default())
+                    .insert(RayCastMesh::<MyRaycastSet>::default()).id();
+                    let chunk_collider_id = commands.spawn_bundle(new_collider).id();
+                    chunk.entity = Some(chunk_id);
+                    chunk.collider = Some(chunk_collider_id);
+                } else {
+                    chunk.entity = None;
+                    chunk.collider = None;
+                }
+                chunk.state = chunk::ChunkState::Rendered;
+                maxSteps -= 1;
+                if maxSteps==0 {
+                    break;
+                }
             }
-            game_state.chunk_states[idx] = chunk::ChunkState::Rendered;
-            maxSteps -= 1;
-            if maxSteps==0 {
-                break;
+        }
+    }
+}
+
+fn handle_tasks(
+    mut commands: Commands,
+    mut transform_tasks: Query<(Entity, &mut Task<(Option<BlockArray>, [i32;3])>)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut game_state: ResMut<Game>,
+    asset_server: Res<AssetServer>,
+) {
+    for (entity, mut task) in transform_tasks.iter_mut() {
+        if let Some((blocks, chunk_pos)) = future::block_on(future::poll_once(&mut *task)) {
+            //Find chunk if it still exists
+            if game_state.chunks.keys().any(|&i| i == chunk_pos) {
+                let chunk = match game_state.chunks.get_mut(&chunk_pos) {
+                    Some(val) => val,
+                    None => {continue;}
+                };
+                if let Some(b) = blocks {
+                    chunk.blocks.set_blocks(b);
+                }
+                // Add the mesh and collider to our tagged entity
+                if let Some((new_mesh, new_collider)) = chunk.blocks.render() {
+                    let texture_handle = asset_server.load("atlas.png");
+                    let material_handle = materials.add(StandardMaterial {
+                        base_color_texture: Some(texture_handle.clone()),
+                        metallic: 0.0,
+                        roughness: 1.0,
+                        reflectance: 0.0,
+                        ..Default::default()
+                    });
+                    let chunk_id = commands.entity(entity).insert_bundle(PbrBundle {
+                        mesh: meshes.add(new_mesh),
+                        material: material_handle,
+                        ..Default::default()
+                    })
+                    .insert(obb::Obb::default())
+                    .insert(RayCastMesh::<MyRaycastSet>::default()).id();
+                    let chunk_collider_id = commands.spawn_bundle(new_collider).id();
+                    chunk.entity = Some(chunk_id);
+                    chunk.collider = Some(chunk_collider_id);
+                } else {
+                    chunk.entity = None;
+                    chunk.collider = None;
+                }
+                chunk.state = chunk::ChunkState::Rendered;
+
+                // Task is complete, so remove task component from entity
+                commands.entity(entity).remove::<Task<(Option<BlockArray>, [i32;3])>>();
             }
         }
     }
@@ -229,17 +410,20 @@ fn chunk_generate_system( mut commands: Commands,
 fn chunk_despawn_system(
     mut game_state: ResMut<Game>,
     mut commands: Commands,
+    thread_pool: Res<AsyncComputeTaskPool>,
     mut transform_query: Query<
         &mut Transform,
         (With<BodyTag>, With<FakeKinematicRigidBody>),
     >,
 ) {
+    let timer = Instant::now();
     // Check for chunks to remove
     let transform = transform_query.single_mut().expect("THERE CAN ONLY BE ONE");
     // generate possible chunk positions
-    let p_pos : [i32;3] = [(transform.translation.x/16.0) as i32,
-        (transform.translation.y/16.0) as i32,
-        (transform.translation.z/16.0) as i32,];
+    let float_chunk_width = CHUNK_WIDTH as f32;
+    let p_pos : [i32;3] = [(transform.translation.x/float_chunk_width) as i32,
+        (transform.translation.y/float_chunk_width) as i32,
+        (transform.translation.z/float_chunk_width) as i32,];
     let mut chunk_pos : Vec<[i32;3]> = vec![];
     for (x, y, z) in iproduct!(p_pos[0]-RENDER_DISTANCE..p_pos[0]+RENDER_DISTANCE, 
         p_pos[1]-RENDER_DISTANCE_VERTICAL..p_pos[1]+RENDER_DISTANCE_VERTICAL, 
@@ -249,189 +433,70 @@ fn chunk_despawn_system(
     chunk_pos.sort_by(|a, b| 
         ((a[0]-p_pos[0]).abs() + (a[1]-p_pos[0]).abs() + (a[2]-p_pos[2]).abs())
         .partial_cmp(&((b[0]-p_pos[0]).abs() + (b[1]-p_pos[0]).abs() + (b[2]-p_pos[2]).abs())).unwrap());
-    for (idx,pos) in game_state.chunkPos.iter().enumerate() {
+    let mut chunks_to_remove = vec![];
+    let current_chunk_pos = game_state.chunks.keys().clone();
+    for pos in current_chunk_pos {
         if !chunk_pos.iter().any(|i| i==pos) {
-            if let Some(chunk_id) = game_state.chunks[idx] {
+            if let Some(chunk_id) = game_state.chunks[pos].entity {
                 commands.entity(chunk_id).despawn();
             };
-            if let Some(chunk_collider_id) = game_state.chunk_colliders[idx] {
+            if let Some(chunk_collider_id) = game_state.chunks[pos].collider {
                 commands.entity(chunk_collider_id).despawn();
             };
-            game_state.chunks.remove(idx);
-            game_state.chunk_colliders.remove(idx);
-            game_state.chunkPos.remove(idx);
-            game_state.chunk_states.remove(idx);
-            game_state.chunk_blocks.remove(idx);
-            break;
+            chunks_to_remove.push(*pos);
         }
     }
-}
-
-fn chunk_render_system (
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    asset_server: Res<AssetServer>,
-    mut transform_query: Query<
-        &mut Transform,
-        (With<BodyTag>, With<FakeKinematicRigidBody>),
-    >,
-    mut game_state: ResMut<Game>,
-) {
-    let startTime = Instant::now();
-    let transform = transform_query.single_mut().expect("THERE CAN ONLY BE ONE");
-    // generate possible chunk positions
-    let p_pos : [i32;3] = [(transform.translation.x/16.0) as i32,
-        (transform.translation.y/16.0) as i32,
-        (transform.translation.z/16.0) as i32,];
-    let mut chunk_pos : Vec<[i32;3]> = vec![];
-    for (x, y, z) in iproduct!(p_pos[0]-RENDER_DISTANCE..p_pos[0]+RENDER_DISTANCE, 
-        p_pos[1]-RENDER_DISTANCE_VERTICAL..p_pos[1]+RENDER_DISTANCE_VERTICAL, 
-        p_pos[2]-RENDER_DISTANCE..p_pos[2]+RENDER_DISTANCE) {
-            chunk_pos.push([x, y, z]);
+    for pos in chunks_to_remove {
+        game_state.chunks.remove(&pos);
     }
-    chunk_pos.sort_by(|a, b| 
-        ((a[0]-p_pos[0]).abs() + (a[1]-p_pos[0]).abs() + (a[2]-p_pos[2]).abs())
-        .partial_cmp(&((b[0]-p_pos[0]).abs() + (b[1]-p_pos[0]).abs() + (b[2]-p_pos[2]).abs())).unwrap());
-    println!("get chunk pos: {:?}", startTime.elapsed());
-    // Check for chunks to add
-    for pos in chunk_pos.iter() {
-        if !game_state.chunkPos.iter().any(|i| i==pos) {
-            game_state.chunkPos.push(*pos);
-            game_state.chunks.push(None);
-            game_state.chunk_colliders.push(None);
-            game_state.chunk_blocks.push([[[0;18];18];18]);
-            game_state.chunk_states.push(chunk::ChunkState::NoGen);
-            break;
-        }
-    }
-    println!("initialize a chunk: {:?}", startTime.elapsed());
-    
-    //let chunks_cpy = game_state.chunks.clone();
-    let mut maxSteps = 3;
-    for idx in 0..game_state.chunks.len() {
-        // chunk hasn't been rendered yet, probably needs to be generated
-        let pos = game_state.chunkPos[idx];
-        if game_state.chunk_states[idx] == chunk::ChunkState::NoGen {
-            // Generate ground
-            if let Some(new_gen) = worldgen::ChunkGenerator::generate(pos, game_state.seed) {
-                game_state.chunk_blocks[idx] = new_gen;
-            }
-            game_state.chunk_states[idx] = chunk::ChunkState::GroundGen;
-            maxSteps -= 1;
-            if maxSteps==0 {
-                break;
-            }
-        } else if game_state.chunk_states[idx] == chunk::ChunkState::GroundGen {
-            if let Some(new_gen) = worldgen::ChunkGenerator::generateStructs(pos, game_state.seed, game_state.chunk_blocks[idx]) {
-                game_state.chunk_blocks[idx] = new_gen;
-            }
-            game_state.chunk_states[idx] = chunk::ChunkState::StructGen;
-            maxSteps -= 1;
-            if maxSteps==0 {
-                break;
-            }
-        } else if game_state.chunk_states[idx] == chunk::ChunkState::StructGen {
-            let mut new_chunk = chunk::Chunk::new(pos);
-            new_chunk.set_blocks(game_state.chunk_blocks[idx]);
-            // chunk can be non-empty but still have data
-            if let Some((new_mesh, new_collider)) = new_chunk.render() {
-                let texture_handle = asset_server.load("atlas.png");
-                let material_handle = materials.add(StandardMaterial {
-                    //base_color: Color::rgb(rand::thread_rng().gen(), rand::thread_rng().gen(), rand::thread_rng().gen()),
-                    base_color_texture: Some(texture_handle.clone()),
-                    unlit: true,
-                    ..Default::default()
-                });
-                let chunk_id = commands.spawn_bundle(PbrBundle {
-                    mesh: meshes.add(new_mesh),
-                    material: material_handle,
-                    ..Default::default()
-                })
-                .insert(RayCastMesh::<MyRaycastSet>::default())
-                .insert(new_chunk).id();
-                let chunk_collider_id = commands.spawn_bundle(new_collider).id();
-                game_state.chunks[idx] = Some(chunk_id);
-                game_state.chunk_colliders[idx] = Some(chunk_collider_id);
-            } else {
-                game_state.chunks[idx] = None;
-                game_state.chunk_colliders[idx] = None;
-            }
-            game_state.chunk_states[idx] = chunk::ChunkState::Rendered;
-            maxSteps -= 1;
-            if maxSteps==0 {
-                break;
-            }
-        }
-    }
-    println!("do some rendering steps: {:?}", startTime.elapsed());
-    // Check for chunks to remove
-    for (idx,pos) in game_state.chunkPos.iter().enumerate() {
-        if !chunk_pos.iter().any(|i| i==pos) {
-            if let Some(chunk_id) = game_state.chunks[idx] {
-                commands.entity(chunk_id).despawn();
-            };
-            if let Some(chunk_collider_id) = game_state.chunk_colliders[idx] {
-                commands.entity(chunk_collider_id).despawn();
-            };
-            game_state.chunks.remove(idx);
-            game_state.chunk_colliders.remove(idx);
-            game_state.chunkPos.remove(idx);
-            game_state.chunk_states.remove(idx);
-            game_state.chunk_blocks.remove(idx);
-            break;
-        }
-    }
-    println!("unrender a chunk: {:?}", startTime.elapsed());
 }
 
 fn updateChunks(
     mut game_state: ResMut<Game>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut chunk_query : Query<(&mut chunk::Chunk, &mut Handle<Mesh>)>,
     mut chunk_collider_query : Query<&mut ColliderShape>,
-    chunk_pos : Vec<[i32;3]>,
-    block_pos : Vec<[i32;3]>,
-    id : u8,
+    mut chunk_mesh_query : Query<&mut Handle<Mesh>>,
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>
 ) {
-    for (idx, pos) in chunk_pos.iter().enumerate() {
-        let mut chunk_idx = 0;
-        for (idx1,ch) in game_state.chunkPos.iter_mut().enumerate() {
-            if ch == pos {
-                chunk_idx = idx1;
-                break;
-            }
-        }
-        let mut new_chunk_collider : Option<Entity> = None;
-        if let Some(chunk_id) = game_state.chunks[chunk_idx] {
-            let (mut chunk, mut chunk_mesh) = chunk_query.get_mut(chunk_id).unwrap();
-            let new_blocks = chunk.setBlock(block_pos[idx], id);
-            game_state.chunk_blocks[chunk_idx] = new_blocks;
-            let new_chunk = Some(chunk_id);
-            if let Some((new_mesh, new_collider)) = chunk.render() {
+    let block_change_queue = game_state.block_change_queue.clone();
+    if game_state.block_change_queue.len() > 0 {
+        println!("Updating {} chunks", game_state.block_change_queue.len());
+    }
+    for (chunk_pos, block_pos, id) in block_change_queue.iter() {
+        //let idx = game_state.current_chunks.iter().position(|x| x == chunk_pos).unwrap();
+        //let chunk = &mut game_state.chunks[idx];
+        let chunk = match game_state.chunks.get_mut(chunk_pos) {
+            Some(val) => val,
+            None => {continue;}
+        };
+        chunk.blocks.setBlock(*block_pos, *id);
+        //let mut new_chunk_collider : Option<Entity> = None;
+        if let Some(chunk_id) = chunk.entity {
+            println!("Updating old mesh");
+            if let Some((new_mesh, new_collider)) = chunk.blocks.render() {
+                let mut chunk_mesh = chunk_mesh_query.get_mut(chunk_id).unwrap();
                 *chunk_mesh = meshes.add(new_mesh);
-                if let Some(chunk_collider_id) = game_state.chunk_colliders[chunk_idx] {
+                if let Some(chunk_collider_id) = chunk.collider {
                     let mut chunk_collider = chunk_collider_query.get_mut(chunk_collider_id).unwrap();
                     *chunk_collider = new_collider.shape;
-                    new_chunk_collider = Some(chunk_collider_id);
+                } else {
+                    let chunk_collider_id = commands.spawn_bundle(new_collider).id();
+                    chunk.collider = Some(chunk_collider_id);
                 }
             }
-            game_state.chunks[chunk_idx] = new_chunk;
-            game_state.chunk_colliders[chunk_idx] = new_chunk_collider;
-        } else {
-            //chunk has never been rendered yet
-            let mut chunk = chunk::Chunk::new(*pos);
-            chunk.set_blocks(game_state.chunk_blocks[chunk_idx]);
-            let new_blocks = chunk.setBlock(block_pos[idx], id);
-            game_state.chunk_blocks[chunk_idx] = new_blocks;
-            if let Some((new_mesh, new_collider)) = chunk.render() {
+            
+        } else  {
+            println!("Making new mesh");
+            if let Some((new_mesh, new_collider)) = chunk.blocks.render() {
                 let texture_handle = asset_server.load("atlas.png");
                 let material_handle = materials.add(StandardMaterial {
                     base_color_texture: Some(texture_handle.clone()),
-                    unlit: true,
+                    metallic: 0.0,
+                    roughness: 1.0,
+                    reflectance: 0.0,
+                    //unlit: false,
                     ..Default::default()
                 });
                 let chunk_id = commands.spawn_bundle(PbrBundle {
@@ -439,29 +504,25 @@ fn updateChunks(
                     material: material_handle,
                     ..Default::default()
                 })
-                .insert(RayCastMesh::<MyRaycastSet>::default())
-                .insert(chunk).id();
+                .insert(obb::Obb::default())
+                .insert(RayCastMesh::<MyRaycastSet>::default()).id();
                 let chunk_collider_id = commands.spawn_bundle(new_collider).id();
-                game_state.chunks[chunk_idx] = Some(chunk_id);
-                game_state.chunk_colliders[chunk_idx] = Some(chunk_collider_id);
+                chunk.entity = Some(chunk_id);
+                chunk.collider = Some(chunk_collider_id);
             }
         }
     }
+    game_state.block_change_queue.clear();
 }
 
 fn handle_mouse(
-    commands: Commands,
-    materials: ResMut<Assets<StandardMaterial>>,
-    asset_server: Res<AssetServer>,
     mut query: Query<&mut RayCastSource<MyRaycastSet>>,
     mut blockhighlight: Query<(&mut Transform, &mut Visible), With<BlockHighlight>>,
-    chunk_query : Query<(&mut chunk::Chunk, &mut Handle<Mesh>)>,
-    chunk_collider_query : Query<&mut ColliderShape>,
     buttons: Res<Input<MouseButton>>,
-    game_state: ResMut<Game>,
-    meshes: ResMut<Assets<Mesh>>,
+    mut game_state: ResMut<Game>,
 ) {
     // Handles block highlighting and mouse button presses
+    let float_chunk_width = CHUNK_WIDTH as f32;
     let source = query.single_mut().unwrap(); 
     let (mut highlight_pos, mut highlight_vis) = blockhighlight.single_mut().unwrap();
     if let Some((_, intersection)) = source.intersect_top() {
@@ -473,71 +534,57 @@ fn handle_mouse(
                                             (position.y - 0.5 * normal.y).floor() as i32,
                                             (position.z - 0.5 * normal.z).floor() as i32,];
             highlight_vis.is_visible = true;
-            highlight_pos.translation = Vec3::new(look_block[0] as f32 + 0.55, look_block[1] as f32 + 0.55, look_block[2] as f32 + 0.55);
+            highlight_pos.translation = Vec3::new(look_block[0] as f32 + 0.5, look_block[1] as f32 + 0.5, look_block[2] as f32 + 0.5);
             if buttons.just_pressed(MouseButton::Right) && distance > 5.0 {
+                println!("Mouse right click");
                 let new_block_pos = [(look_block[0] as f32 + normal.x.floor()) as i32, 
                     (look_block[1] as f32 + normal.y.floor()) as i32, 
                     (look_block[2] as f32 + normal.z.floor()) as i32];
-                let mouse_chunk = [((new_block_pos[0] as f32 - 1.0) / 16.0).floor() as i32, 
-                    ((new_block_pos[1] as f32 - 1.0) / 16.0).floor() as i32,
-                    ((new_block_pos[2] as f32 - 1.0) / 16.0).floor() as i32];
-                let rel_block_pos = [(new_block_pos[0] - (16 * mouse_chunk[0])),(new_block_pos[1] - (16 * mouse_chunk[1])),(new_block_pos[2] - (16 * mouse_chunk[2]))];
-                let mut chunks_to_update : Vec<[i32;3]> = vec![mouse_chunk];
-                let mut blocks_to_update : Vec<[i32;3]> = vec![rel_block_pos];
+                let mouse_chunk = [((new_block_pos[0] as f32 - 1.0) / float_chunk_width).floor() as i32, 
+                    ((new_block_pos[1] as f32 - 1.0) / float_chunk_width).floor() as i32,
+                    ((new_block_pos[2] as f32 - 1.0) / float_chunk_width).floor() as i32];
+                let rel_block_pos = [(new_block_pos[0] - (CHUNK_WIDTH * mouse_chunk[0])),(new_block_pos[1] - (CHUNK_WIDTH * mouse_chunk[1])),(new_block_pos[2] - (CHUNK_WIDTH * mouse_chunk[2]))];
+                game_state.block_change_queue.push((mouse_chunk, rel_block_pos, 1));
                 // find chunk with correct position
                 if rel_block_pos[0] == 1 {
-                    chunks_to_update.push([mouse_chunk[0] - 1, mouse_chunk[1], mouse_chunk[2]]);
-                    blocks_to_update.push([17, rel_block_pos[1], rel_block_pos[2]]);
-                } else if rel_block_pos[0] == 16 {
-                    chunks_to_update.push([mouse_chunk[0] + 1, mouse_chunk[1], mouse_chunk[2]]);
-                    blocks_to_update.push([0, rel_block_pos[1], rel_block_pos[2]]);
+                    game_state.block_change_queue.push(([mouse_chunk[0] - 1, mouse_chunk[1], mouse_chunk[2]],[17, rel_block_pos[1], rel_block_pos[2]],1));
+                } else if rel_block_pos[0] == CHUNK_WIDTH {
+                    game_state.block_change_queue.push(([mouse_chunk[0] + 1, mouse_chunk[1], mouse_chunk[2]],[0, rel_block_pos[1], rel_block_pos[2]],1));
                 }
                 if rel_block_pos[1] == 1 {
-                    chunks_to_update.push([mouse_chunk[0], mouse_chunk[1]-1, mouse_chunk[2]]);
-                    blocks_to_update.push([rel_block_pos[0],17, rel_block_pos[2]]);
-                } else if rel_block_pos[1] == 16 {
-                    chunks_to_update.push([mouse_chunk[0], mouse_chunk[1]+1, mouse_chunk[2]]);
-                    blocks_to_update.push([rel_block_pos[0],0, rel_block_pos[2]]);
+                    game_state.block_change_queue.push(([mouse_chunk[0], mouse_chunk[1]-1, mouse_chunk[2]],[rel_block_pos[0],17, rel_block_pos[2]],1));
+                } else if rel_block_pos[1] == CHUNK_WIDTH {
+                    game_state.block_change_queue.push(([mouse_chunk[0], mouse_chunk[1]+1, mouse_chunk[2]],[rel_block_pos[0],0, rel_block_pos[2]],1));
                 }
                 if rel_block_pos[2] == 1 {
-                    chunks_to_update.push([mouse_chunk[0], mouse_chunk[1], mouse_chunk[2]-1]);
-                    blocks_to_update.push([rel_block_pos[0], rel_block_pos[1], 17]);
-                } else if rel_block_pos[2] == 16 {
-                    chunks_to_update.push([mouse_chunk[0], mouse_chunk[1], mouse_chunk[2]+1]);
-                    blocks_to_update.push([rel_block_pos[0], rel_block_pos[1], 0]);
+                    game_state.block_change_queue.push(([mouse_chunk[0], mouse_chunk[1], mouse_chunk[2]-1],[rel_block_pos[0], rel_block_pos[1], 17],1));
+                } else if rel_block_pos[2] == CHUNK_WIDTH {
+                    game_state.block_change_queue.push(([mouse_chunk[0] - 1, mouse_chunk[1], mouse_chunk[2]],[17, rel_block_pos[1], rel_block_pos[2]],1));
                 }
-                updateChunks(game_state, meshes, chunk_query, chunk_collider_query, chunks_to_update, blocks_to_update, 1, commands, materials, asset_server);
             } else if buttons.just_pressed(MouseButton::Left) {
+                println!("Mouse left click");
                 // add block
-                let mouse_chunk = [((look_block[0] as f32 - 1.0) / 16.0).floor() as i32, 
-                    ((look_block[1] as f32 - 1.0) / 16.0).floor() as i32,
-                    ((look_block[2] as f32 - 1.0) / 16.0).floor() as i32];
-                let rel_block_pos = [(look_block[0] - (16 * mouse_chunk[0])),(look_block[1] - (16 * mouse_chunk[1])),(look_block[2] - (16 * mouse_chunk[2]))];
-                let mut chunks_to_update : Vec<[i32;3]> = vec![mouse_chunk];
-                let mut blocks_to_update : Vec<[i32;3]> = vec![rel_block_pos];
+                let mouse_chunk = [((look_block[0] as f32 - 1.0) / float_chunk_width).floor() as i32, 
+                    ((look_block[1] as f32 - 1.0) / float_chunk_width).floor() as i32,
+                    ((look_block[2] as f32 - 1.0) / float_chunk_width).floor() as i32];
+                let rel_block_pos = [(look_block[0] - (CHUNK_WIDTH * mouse_chunk[0])),(look_block[1] - (CHUNK_WIDTH * mouse_chunk[1])),(look_block[2] - (CHUNK_WIDTH * mouse_chunk[2]))];
+                game_state.block_change_queue.push((mouse_chunk, rel_block_pos, 0));
                 // update surrounding chunks if necessary
                 if rel_block_pos[0] == 1 {
-                    chunks_to_update.push([mouse_chunk[0] - 1, mouse_chunk[1], mouse_chunk[2]]);
-                    blocks_to_update.push([17, rel_block_pos[1], rel_block_pos[2]]);
-                } else if rel_block_pos[0] == 16 {
-                    chunks_to_update.push([mouse_chunk[0] + 1, mouse_chunk[1], mouse_chunk[2]]);
-                    blocks_to_update.push([0, rel_block_pos[1], rel_block_pos[2]]);
+                    game_state.block_change_queue.push(([mouse_chunk[0] - 1, mouse_chunk[1], mouse_chunk[2]],[17, rel_block_pos[1], rel_block_pos[2]],0));
+                } else if rel_block_pos[0] == CHUNK_WIDTH {
+                    game_state.block_change_queue.push(([mouse_chunk[0] + 1, mouse_chunk[1], mouse_chunk[2]],[0, rel_block_pos[1], rel_block_pos[2]],0));
                 }
                 if rel_block_pos[1] == 1 {
-                    chunks_to_update.push([mouse_chunk[0], mouse_chunk[1]-1, mouse_chunk[2]]);
-                    blocks_to_update.push([rel_block_pos[0],17, rel_block_pos[2]]);
-                } else if rel_block_pos[1] == 16 {
-                    chunks_to_update.push([mouse_chunk[0], mouse_chunk[1]+1, mouse_chunk[2]]);
-                    blocks_to_update.push([rel_block_pos[0],0, rel_block_pos[2]]);
+                    game_state.block_change_queue.push(([mouse_chunk[0], mouse_chunk[1]-1, mouse_chunk[2]],[rel_block_pos[0],17, rel_block_pos[2]],0));
+                } else if rel_block_pos[1] == CHUNK_WIDTH {
+                    game_state.block_change_queue.push(([mouse_chunk[0], mouse_chunk[1]+1, mouse_chunk[2]],[rel_block_pos[0],0, rel_block_pos[2]],0));
                 }
                 if rel_block_pos[2] == 1 {
-                    chunks_to_update.push([mouse_chunk[0], mouse_chunk[1], mouse_chunk[2]-1]);
-                    blocks_to_update.push([rel_block_pos[0], rel_block_pos[1], 17]);
-                } else if rel_block_pos[2] == 16 {
-                    chunks_to_update.push([mouse_chunk[0], mouse_chunk[1], mouse_chunk[2]+1]);
-                    blocks_to_update.push([rel_block_pos[0], rel_block_pos[1], 0]);
+                    game_state.block_change_queue.push(([mouse_chunk[0], mouse_chunk[1], mouse_chunk[2]-1],[rel_block_pos[0], rel_block_pos[1], 17],0));
+                } else if rel_block_pos[2] == CHUNK_WIDTH {
+                    game_state.block_change_queue.push(([mouse_chunk[0], mouse_chunk[1], mouse_chunk[2]+1],[rel_block_pos[0], rel_block_pos[1], 0],0));
                 }
-                updateChunks(game_state, meshes, chunk_query, chunk_collider_query, chunks_to_update, blocks_to_update, 0, commands, materials, asset_server);
             }
         }
     } else {
@@ -545,3 +592,4 @@ fn handle_mouse(
         highlight_vis.is_visible = false;
     }
 }
+

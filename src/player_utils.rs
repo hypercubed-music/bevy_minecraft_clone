@@ -1,4 +1,6 @@
-use bevy::{input::system::exit_on_esc_system, prelude::*, diagnostic::{Diagnostics, FrameTimeDiagnosticsPlugin},};
+use bevy::{input::system::exit_on_esc_system, 
+    prelude::*, 
+    diagnostic::{Diagnostics, FrameTimeDiagnosticsPlugin}, };
 use bevy_prototype_character_controller::{
     controller::{
         BodyTag, CameraTag, CharacterController, CharacterControllerPlugin, HeadTag, Mass, YawTag,
@@ -12,6 +14,9 @@ use bevy_rapier3d::{
 };
 use bevy_rapier3d::{prelude::*};
 use bevy_mod_raycast::{RayCastSource, build_rays, update_raycast, RaycastSystem, PluginState};
+use bevy_frustum_culling::*;
+use bevy_physical_sky::{
+    PhysicalSkyCameraTag};
 pub struct BlockHighlight;
 
 pub struct CharacterSettings {
@@ -44,7 +49,9 @@ impl Default for CharacterSettings {
 pub struct FakeKinematicRigidBody;
 
 pub fn build_app(app: &mut AppBuilder) {
-    app.add_plugins(DefaultPlugins)
+    //app.add_plugins(DefaultPlugins)
+    app.insert_resource(Msaa { samples: 4 })
+        .add_plugins(DefaultPlugins)
         .add_plugin(CharacterControllerPlugin)
         .add_plugin(FrameTimeDiagnosticsPlugin::default())
         .init_resource::<PluginState<MyRaycastSet>>()
@@ -79,9 +86,11 @@ pub fn spawn_character(
             GlobalTransform::identity(),
             Transform::from_translation(Vec3::new(0.5,80.0,0.5)),
             CharacterController{
+                //walk_speed : 7.0,
                 walk_speed : 7.0,
                 run_speed : 10.0,
                 jumping : true,
+                //fly: true,
                 ..Default::default()
             },
             FakeKinematicRigidBody,
@@ -139,7 +148,8 @@ pub fn spawn_character(
         })
         .insert_bundle((LookDirection::default(), CameraTag))
         .insert(RayCastSource::<MyRaycastSet>::new_transform_empty())
-        //.insert_bundle(PickingCameraBundle::default())
+        .insert(FrustumCulling)
+        .insert(PhysicalSkyCameraTag)
         .id();
     commands
         .entity(body)
@@ -187,14 +197,6 @@ pub fn controller_to_kinematic(
                 controller.velocity.z = 0.0;
             }
 
-            let gravity_ray = Ray::new((transform.translation).into(), (-Vec3::Y).into());
-            
-            if let Some((_,toi)) = query_pipeline.cast_ray(
-                &collider_set, &gravity_ray, 100.0, solid, groups, filter) {
-                    if (gravity_ray.point_at(toi).y - state.last_ground_point).abs() > f32::EPSILON {
-                        state.last_ground_point = gravity_ray.point_at(toi).y;
-                    }
-            }
             if state.last_ground_point + 0.5 < transform.translation.y {
                 // fall as normal
                 controller.jumping = true;
@@ -207,6 +209,15 @@ pub fn controller_to_kinematic(
                 // stop falling
                 controller.jumping = false;
                 transform.translation.y = state.last_ground_point + 0.5;
+            }
+
+            let gravity_ray = Ray::new((transform.translation + Vec3::Y).into(), (-Vec3::Y).into());
+            
+            if let Some((_,toi)) = query_pipeline.cast_ray(
+                &collider_set, &gravity_ray, 1000.0, solid, groups, filter) {
+                    if (gravity_ray.point_at(toi).y - state.last_ground_point).abs() > f32::EPSILON {
+                        state.last_ground_point = gravity_ray.point_at(toi).y;
+                    }
             }
         }
     }

@@ -6,18 +6,25 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bevy = "0.5.0"
+# bevy = { git = "https://github.com/bevyengine/bevy", rev = "59bfbd3295ed34f7aec1d8339bab10a339877242" }
+bevy = "0.5"
 ndarray = "0.15.0"
 nalgebra = "0.29.0"
-noise = "0.7"
+#noise = "0.7"
+simdnoise = "3.1.0"
 itertools = "0.10"
-bevy_prototype_character_controller = { git = "https://github.com/superdump/bevy_prototype_character_controller" }
-rand = "0.8"
+#bevy_prototype_character_controller = { git = "https://github.com/superdump/bevy_prototype_character_controller", rev= "44a008f27430dedd3602d12960286a626357f761" }
+bevy_prototype_character_controller = { git = "https://github.com/superdump/bevy_prototype_character_controller"}
+rand = {version = "0.8", features = ["small_rng"]}
 bevy_rapier3d = "0.11"
 bevy_mod_raycast = "0.2"
+bevy_frustum_culling = {git="https://github.com/aevyrie/bevy_frustum_culling"}
+bevy-physical-sky = { path = "crates/bevy-physical-sky" }
+rustc-hash = "1.1.0"
+futures-lite = "1.12"
 
 [profile.dev.package."*"]
 opt-level = 3
 
 [profile.dev]
-opt-level = 1
+opt-level = 3

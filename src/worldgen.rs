@@ -4,6 +4,7 @@ use itertools::*;
 use std::cmp;
 use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
+use building_blocks::storage::prelude::*;
 
 const CHUNK_WIDTH:i32 = 32;
 const CHUNK_WIDTH_U:usize = 32;
@@ -49,13 +50,13 @@ impl Structure for TreeGen {
             let dy = y - (y_pos+height+1);
             let dz = z - z_pos;
             if (dx * dx) + (dy * dy) + (dz * dz) < 9 {
-                tree_points.push((x, y, z, 5));
+                tree_points.push((x, y, z, 34));
             }
         }
         // trunk 
         
         for y in y_pos..y_pos+height {
-            tree_points.push((x_pos, y, z_pos, 4));
+            tree_points.push((x_pos, y, z_pos, 75));
         }
 
         tree_points
@@ -79,13 +80,13 @@ impl Structure for PineTreeGen {
             let dx = x - x_pos;
             let dz = z - z_pos;
             if (dx * dx) + (dz * dz) < rad as i32 {
-                tree_points.push((x, y, z, 5));
+                tree_points.push((x, y, z, 34));
             }
         }
         // trunk
         
         for y in y_pos..y_pos+height {
-            tree_points.push((x_pos, y, z_pos, 4));
+            tree_points.push((x_pos, y, z_pos, 75));
         }
 
         tree_points
@@ -104,9 +105,9 @@ pub struct ChunkGenerator {
 
 impl ChunkGenerator {
     pub fn new(position : [i32;3], seed: u32, map_extra_width: i32) -> ChunkGenerator {
-        let start_x = (position[0] * CHUNK_WIDTH) - map_extra_width;
+        let start_x = (position[0] * CHUNK_WIDTH) - 1;
         let start_y = (position[1] * CHUNK_WIDTH) - 1;
-        let start_z = (position[2] * CHUNK_WIDTH) - map_extra_width;
+        let start_z = (position[2] * CHUNK_WIDTH) - 1;
         let ex_width_usize = map_extra_width as usize;
         let (cavenoise,_,_) = NoiseBuilder::fbm_3d_offset(start_x as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2, start_y as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2, start_z as f32, CHUNK_WIDTH_U + 10)
             .with_freq(1.0/16.0).with_octaves(1).with_seed(seed as i32).generate();
@@ -178,12 +179,12 @@ impl ChunkGenerator {
     }
 
     pub fn build_maps(&mut self) {
-        let start_x = (self.pos[0] * CHUNK_WIDTH) - self.map_extra_width;
+        let start_x = (self.pos[0] * CHUNK_WIDTH) - 1;
         let start_y = (self.pos[1] * CHUNK_WIDTH) - 1;
-        let start_z = (self.pos[2] * CHUNK_WIDTH) - self.map_extra_width;
+        let start_z = (self.pos[2] * CHUNK_WIDTH) - 1;
         let ex_width_usize = self.map_extra_width as usize;
-        let (cavenoise,_,_) = NoiseBuilder::fbm_3d_offset(start_x as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2, start_y as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2, start_z as f32, CHUNK_WIDTH_U + 10)
-            .with_freq(1.0/16.0).with_octaves(1).with_seed(self.seed as i32).generate();
+        let (cavenoise,_,_) = NoiseBuilder::fbm_3d_offset(start_x as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2, start_y as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2, start_z as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2)
+            .with_freq(1.0/32.0).with_octaves(1).with_seed(self.seed as i32).generate();
         let (lownoise,_,_) = NoiseBuilder::fbm_2d_offset(start_x as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2, start_z as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2)
             .with_freq(1.0/16.0).with_octaves(5).with_seed((self.seed+1) as i32).generate();
         let (highnoise,_,_) = NoiseBuilder::fbm_2d_offset(start_x as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2, start_z as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2)
@@ -199,17 +200,11 @@ impl ChunkGenerator {
             let height = cmp::max(low_value, high_value);
             let biome = (biomenoise[noise_idx] * 3.0) as i32;
 
-            // stuctures
-            if start_y + CHUNK_WIDTH + 2 >= height && start_y <= height + 10 && low_value > high_value {
-                let abs_xz = [start_x + x, start_z + z];
-                if tree_xz_points.iter().any(|&i| i == abs_xz) {
-                    self.tree_points.push((abs_xz[0], abs_xz[1]));
-                }
-            }
-
             //cave noise
-            for y in 0..CHUNK_WIDTH+2 {
-                let mut cave_value = 0.5 - (cavenoise[((x + self.map_extra_width+1) * (CHUNK_WIDTH * CHUNK_WIDTH + 4) + y * (CHUNK_WIDTH + 2) + (z + self.map_extra_width+1)) as usize]).abs();
+            for y in -self.map_extra_width-1..CHUNK_WIDTH+self.map_extra_width+1 {
+                let cave_noise_value = cavenoise[((x + self.map_extra_width+1) * map_size*map_size + (y + self.map_extra_width+1) * map_size + (z + self.map_extra_width+1)) as usize];
+                let mut cave_value = (cave_noise_value * 10.0).abs();
+                //println!("{}", cave_noise_value);
                 let abs_y = y + start_y;
                 cave_value *= if abs_y > 128 {
                     1.0
@@ -218,7 +213,15 @@ impl ChunkGenerator {
                 } else {
                     (abs_y as f32)/128.0
                 };
-                self.cavemap.push(cave_value > 0.05);
+                self.cavemap.push(cave_value < 0.05);
+            }
+
+            // stuctures
+            if start_y + CHUNK_WIDTH + 2 >= height && start_y <= height + 10 && low_value > high_value {
+                let abs_xz = [start_x + x, start_z + z];
+                if tree_xz_points.iter().any(|&i| i == abs_xz) {
+                    self.tree_points.push((abs_xz[0], abs_xz[1]));
+                }
             }
             self.heightmap.push(height);
             self.biomemap.push(biome);
@@ -239,19 +242,20 @@ impl ChunkGenerator {
         for (x, z) in iproduct!(0..CHUNK_WIDTH+2, 0..CHUNK_WIDTH+2) {
             let noise_idx = ((z+self.map_extra_width) * map_size + (x+self.map_extra_width)) as usize;
             let biome = self.biomemap[noise_idx];
+            //let biome = 0;
             let height = self.heightmap[noise_idx];
             if biome <= 0 {
                 //Normal
                 for y in 0..CHUNK_WIDTH+2 {
                     let abs_y = y + start_y;
-                    let is_not_cave = self.cavemap[((z+self.map_extra_width) * map_size * (CHUNK_WIDTH + 2) + (x + self.map_extra_width) * (CHUNK_WIDTH + 2) + y) as usize];
+                    let is_not_cave = self.cavemap[((z + self.map_extra_width+1) * (map_size * map_size) + (x + self.map_extra_width+1) * map_size + (y + self.map_extra_width+1)) as usize];
                     if is_not_cave && abs_y < height {
                         blockIDs[x as usize][y as usize][z as usize] = if abs_y == height - 1 {
-                            3
+                            5
                         } else if abs_y > height - 4 {
-                            2
+                            10
                         } else {
-                            1
+                            27
                         };
                     }
                 }
@@ -259,12 +263,12 @@ impl ChunkGenerator {
                 //Desert
                 for y in 0..CHUNK_WIDTH+2 {
                     let abs_y = y + start_y;
-                    let is_not_cave = self.cavemap[((z+self.map_extra_width) * map_size * (CHUNK_WIDTH + 2) + (x + self.map_extra_width) * (CHUNK_WIDTH + 2) + y) as usize];
+                    let is_not_cave = self.cavemap[((z + self.map_extra_width+1) * (map_size * map_size) + (x + self.map_extra_width+1) * map_size + (y + self.map_extra_width+1)) as usize];
                     if is_not_cave && abs_y < height {
                         blockIDs[x as usize][y as usize][z as usize] = if abs_y > height - 4 {
-                            6
+                            49
                         } else {
-                            1
+                            27
                         };
                     }
                 }
@@ -272,14 +276,14 @@ impl ChunkGenerator {
                 // Snow
                 for y in 0..CHUNK_WIDTH+2 {
                     let abs_y = y + start_y;
-                    let is_not_cave = self.cavemap[((z+self.map_extra_width) * map_size * (CHUNK_WIDTH + 2) + (x + self.map_extra_width) * (CHUNK_WIDTH + 2) + y) as usize];
+                    let is_not_cave = self.cavemap[((z + self.map_extra_width+1) * (map_size * map_size) + (x + self.map_extra_width+1) * map_size + (y + self.map_extra_width+1)) as usize];
                     if is_not_cave && abs_y < height {
                         blockIDs[x as usize][y as usize][z as usize] = if abs_y == height - 1 {
-                            7
+                            50
                         } else if abs_y > height - 4 {
-                            2
+                            10
                         } else {
-                            1
+                            27
                         };
                     }
                 }

@@ -4,12 +4,21 @@ use bevy::{render::pipeline::PrimitiveTopology,
             render::mesh::Indices, render::mesh::Mesh};
 use bevy_rapier3d::prelude::*;
 use std::time::{Duration, Instant};
+use building_blocks::core::prelude::*;
+use building_blocks::mesh::{
+    greedy_quads, GreedyQuadsBuffer, IsOpaque, MergeVoxel, PosNormTexMesh, OrientedCubeFace, UnorientedQuad,
+    RIGHT_HANDED_Y_UP_CONFIG,quad
+};
+use building_blocks::storage::prelude::*;
+use bevy::prelude::*;
 //use nalgebra::base::{Vector2, Vector3};
+
+type Faces = (Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>);
 
 const CHUNK_WIDTH : i32 = 32;
 const CHUNK_WIDTH_U : usize = 32;
 
-const TEXIMG_WIDTH : f32 = 32.0;
+pub const TEXIMG_WIDTH : f32 = 85.0;
 const TEX_OFFSETS : [[[f32;2];6];8] = [[[0.0,0.0],[0.0,0.0],[0.0,0.0],[0.0,0.0],[0.0,0.0],[0.0,0.0],], //air?
                                             [[19.0,0.0],[19.0,0.0],[19.0,0.0],[19.0,0.0],[19.0,0.0],[19.0,0.0]], // stone
                                             [[11.0,1.0],[11.0,1.0],[11.0,1.0],[11.0,1.0],[11.0,1.0],[11.0,1.0]], //grass
@@ -38,8 +47,76 @@ pub enum ChunkState {
     Rendered
 }
 
+struct MeshData {
+    verts: Vec<Vector3<f32>>, 
+    uvs: Vec<Vector2<f32>>, 
+    norms: Vec<[f32;3]>
+}
+
+#[derive(Debug, Default, Clone)]
+struct MeshBuf {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub tex_coords: Vec<[f32; 2]>,
+    pub layer: Vec<u32>,
+    pub indices: Vec<u32>,
+}
+
+impl MeshBuf {
+    fn add_quad(
+        &mut self,
+        face: &OrientedCubeFace,
+        quad: &UnorientedQuad,
+        u_flip_face: Axis3,
+        layer: u32,
+    ) {
+        let voxel_size = 1.0;
+        let start_index = self.positions.len() as u32;
+        self.positions
+            .extend_from_slice(&face.quad_mesh_positions(quad, voxel_size));
+        self.normals.extend_from_slice(&face.quad_mesh_normals());
+
+        let flip_v = true;
+        let mut uvs = face.tex_coords(u_flip_face, flip_v, quad);
+        /*for uv in uvs.iter_mut() {
+            for c in uv.iter_mut() {
+                *c *= 0.1;
+            }
+        }*/
+        self.tex_coords.extend_from_slice(&uvs);
+
+        self.layer.extend_from_slice(&[layer; 4]);
+        self.indices
+            .extend_from_slice(&face.quad_mesh_indices(start_index));
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct Voxel(u8);
+
+impl MergeVoxel for Voxel {
+    type VoxelValue = u8;
+
+    fn voxel_merge_value(&self) -> Self::VoxelValue {
+        self.0
+    }
+}
+
+impl IsOpaque for Voxel {
+    fn is_opaque(&self) -> bool {
+        true
+    }
+}
+
+impl IsEmpty for Voxel {
+    fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+}
+
 pub struct Chunk {
-    pub position : Vector3<i32>,
+    //pub position : Vector3<i32>,
+    pub position : [i32;3],
     //blockIDs : Array3::<u8>,
     pub blockIDs : [[[u8; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2],
 }
@@ -48,7 +125,8 @@ impl Chunk {
 
     pub fn new(position : [i32;3]) -> Self {
         Chunk {
-            position : Vector3::new(position[0], position[1], position[2]),
+            //position : Vector3::new(position[0], position[1], position[2]),
+            position,
             //blockIDs : Array3::<u8>::zeros(((CHUNK_WIDTH+2) as usize, (CHUNK_WIDTH+2) as usize, (CHUNK_WIDTH+2) as usize))
             blockIDs : [[[0; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2],
         }
@@ -99,11 +177,82 @@ impl Chunk {
         self
     }
 
-    fn buildMesh(&mut self, faces : (Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>))
+    pub fn render_new(&self) -> Option<(Mesh, ColliderBundle)> {
+        let offset = [(self.position[0]* CHUNK_WIDTH), 
+            (self.position[1] * CHUNK_WIDTH),
+            (self.position[2] * CHUNK_WIDTH)];
+
+        let extent = Extent3i::from_min_and_shape(PointN(offset), PointN([CHUNK_WIDTH+2; 3]));
+        let voxels = Array3x1::fill_with(extent, |point|
+            Voxel(self.blockIDs[(point.x() - offset[0]) as usize][(point.y() - offset[1]) as usize][(point.z() - offset[2]) as usize])
+        );
+        let mut greedy_buffer = GreedyQuadsBuffer::new(extent, RIGHT_HANDED_Y_UP_CONFIG.quad_groups());
+        greedy_quads(&voxels, &extent, &mut greedy_buffer);
+
+        let mut mesh_buf = MeshBuf::default();
+        for group in greedy_buffer.quad_groups.iter() {
+            for quad in group.quads.iter() {
+                let mat = voxels.get(quad.minimum);
+                mesh_buf.add_quad(
+                    &group.face,
+                    quad,
+                    RIGHT_HANDED_Y_UP_CONFIG.u_flip_face,
+                    mat.0 as u32 - 1,
+                );
+            }
+        }
+
+        let mut render_mesh = Mesh::new(PrimitiveTopology::TriangleList);
+
+        let MeshBuf {
+            positions,
+            normals,
+            tex_coords,
+            layer,
+            indices,
+        } = mesh_buf;
+
+        // copy before move
+        let positions_copy = positions.clone();
+        let indices_copy = indices.clone();
+
+        render_mesh.set_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        render_mesh.set_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+        render_mesh.set_attribute(Mesh::ATTRIBUTE_UV_0, tex_coords);
+        render_mesh.set_attribute("Vertex_Layer", layer);
+        render_mesh.set_indices(Some(Indices::U32(indices)));
+
+        
+        //conversion for collider.....
+        let mut new_positions : Vec<Point<Real, 3>> = vec![];
+        for v in positions_copy.iter() {
+            new_positions.push(Point::<Real, 3>::new(v[0], v[1], v[2]));
+        }
+        let mut new_indices : Vec<[u32; 3]> = vec![];
+        for i in (0..indices_copy.len()).step_by(3) {
+            new_indices.push([indices_copy[i], indices_copy[i+1], indices_copy[i+2]]);
+        }
+        if new_positions.len() > 0 {
+            let collider = ColliderBundle {
+                shape : ColliderShape::trimesh(new_positions, new_indices),
+                collider_type : ColliderType::Solid,
+                ..Default::default()
+            };
+
+            Some((render_mesh, collider))
+        } else {
+            None
+        }
+    }
+
+    fn buildMesh(&mut self, faces : Faces)
         -> (Vec<Vector3<f32>>, Vec<Vector2<f32>>, Vec<[f32;3]>) {
-        let offset = Vector3::new((self.position.x * (CHUNK_WIDTH)) as f32, 
+        /*let offset = Vector3::new((self.position.x * (CHUNK_WIDTH)) as f32, 
             (self.position.y * (CHUNK_WIDTH)) as f32,
-            (self.position.z * (CHUNK_WIDTH)) as f32);
+            (self.position.z * (CHUNK_WIDTH)) as f32);*/
+        let offset = Vector3::new((self.position[0]* (CHUNK_WIDTH)) as f32, 
+            (self.position[1] * (CHUNK_WIDTH)) as f32,
+            (self.position[2] * (CHUNK_WIDTH)) as f32);
         let mut verts = vec![];
         let mut uvs = vec![];
         let mut norms = vec![];
@@ -164,7 +313,7 @@ impl Chunk {
         (verts, uvs, norms)
     }
 
-    fn getRenderable(&self) -> (Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>, Vec<Vector3<f32>>) {
+    fn getRenderable(&self) -> Faces {
         // Goes through blockIDs and generates a list of renderable faces
         let mut right : Vec<Vector3<f32>> = vec![];
         let mut left : Vec<Vector3<f32>> = vec![];

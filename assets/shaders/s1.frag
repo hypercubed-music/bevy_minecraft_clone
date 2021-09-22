@@ -1,3 +1,32 @@
+// MIT License
+
+// Copyright (c) 2020 Carter Anderson
+// Copyright (c) 2021 Robert Swain <robert.swain@gmail.com>
+
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// Default bevy PBR shaders with added vertex attribute for texture layer
+// and using an array texture for the base colour
+//
+// NOTE: These are from bevy v0.5.0 exactly and must be updated when bevy is
+// updated!
+
 #version 450
 
 // From the Filament design doc
@@ -34,24 +63,17 @@
 //
 // The above integration needs to be approximated.
 
-// reflects the constants defined bevy_pbr/src/render_graph/mod.rs
-const int MAX_POINT_LIGHTS = 10;
-const int MAX_DIRECTIONAL_LIGHTS = 1;
+const int MAX_LIGHTS = 10;
 
-struct PointLight {
+struct Light {
+    mat4 proj;
     vec4 pos;
-    vec4 color;
-    vec4 lightParams;
-};
- 
-struct DirectionalLight {
-    vec4 direction;
     vec4 color;
 };
 
 layout(location = 0) in vec3 v_WorldPosition;
 layout(location = 1) in vec3 v_WorldNormal;
-layout(location = 2) in vec2 v_Uv;
+layout(location = 2) in vec3 v_Uv;
 
 #ifdef STANDARDMATERIAL_NORMAL_MAP
 layout(location = 3) in vec4 v_WorldTangent;
@@ -68,9 +90,8 @@ layout(std140, set = 0, binding = 1) uniform CameraPosition {
 
 layout(std140, set = 1, binding = 0) uniform Lights {
     vec4 AmbientColor;
-    uvec4 NumLights; // x = point lights, y = directional lights
-    PointLight PointLights[MAX_POINT_LIGHTS];
-    DirectionalLight DirectionalLights[MAX_DIRECTIONAL_LIGHTS];
+    uvec4 NumLights;
+    Light SceneLights[MAX_LIGHTS];
 };
 
 layout(set = 3, binding = 0) uniform StandardMaterial_base_color {
@@ -78,7 +99,7 @@ layout(set = 3, binding = 0) uniform StandardMaterial_base_color {
 };
 
 #ifdef STANDARDMATERIAL_BASE_COLOR_TEXTURE
-layout(set = 3, binding = 1) uniform texture2D StandardMaterial_base_color_texture;
+layout(set = 3, binding = 1) uniform texture2DArray StandardMaterial_base_color_texture;
 layout(set = 3,
        binding = 2) uniform sampler StandardMaterial_base_color_texture_sampler;
 #endif
@@ -94,7 +115,7 @@ layout(set = 3, binding = 4) uniform StandardMaterial_metallic {
 };
 
 #    ifdef STANDARDMATERIAL_METALLIC_ROUGHNESS_TEXTURE
-layout(set = 3, binding = 5) uniform texture2D StandardMaterial_metallic_roughness_texture;
+layout(set = 3, binding = 5) uniform texture2DArray StandardMaterial_metallic_roughness_texture;
 layout(set = 3,
        binding = 6) uniform sampler StandardMaterial_metallic_roughness_texture_sampler;
 #    endif
@@ -104,13 +125,13 @@ layout(set = 3, binding = 7) uniform StandardMaterial_reflectance {
 };
 
 #    ifdef STANDARDMATERIAL_NORMAL_MAP
-layout(set = 3, binding = 8) uniform texture2D StandardMaterial_normal_map;
+layout(set = 3, binding = 8) uniform texture2DArray StandardMaterial_normal_map;
 layout(set = 3,
        binding = 9) uniform sampler StandardMaterial_normal_map_sampler;
 #    endif
 
 #    if defined(STANDARDMATERIAL_OCCLUSION_TEXTURE)
-layout(set = 3, binding = 10) uniform texture2D StandardMaterial_occlusion_texture;
+layout(set = 3, binding = 10) uniform texture2DArray StandardMaterial_occlusion_texture;
 layout(set = 3,
        binding = 11) uniform sampler StandardMaterial_occlusion_texture_sampler;
 #    endif
@@ -120,10 +141,27 @@ layout(set = 3, binding = 12) uniform StandardMaterial_emissive {
 };
 
 #    if defined(STANDARDMATERIAL_EMISSIVE_TEXTURE)
-layout(set = 3, binding = 13) uniform texture2D StandardMaterial_emissive_texture;
+layout(set = 3, binding = 13) uniform texture2DArray StandardMaterial_emissive_texture;
 layout(set = 3,
        binding = 14) uniform sampler StandardMaterial_emissive_texture_sampler;
 #    endif
+
+layout(set = 2, binding = 1) uniform FadeUniform_duration {
+    float fade_duration;
+};
+layout(set = 2, binding = 2) uniform FadeUniform_remaining {
+    float fade_remaining;
+};
+
+struct FogConfig_t {
+    vec4 color;
+    float near;
+    float far;
+};
+
+layout(set = 2, binding = 3) uniform FogConfig {
+    FogConfig_t fog;
+};
 
 #    define saturate(x) clamp(x, 0.0, 1.0)
 const float PI = 3.141592653589793;
@@ -138,8 +176,9 @@ float pow5(float x) {
 //
 // light radius is a non-physical construct for efficiency purposes,
 // because otherwise every light affects every fragment in the scene
-float getDistanceAttenuation(float distanceSquare, float inverseRangeSquared) {
-    float factor = distanceSquare * inverseRangeSquared;
+float getDistanceAttenuation(const vec3 posToLight, float inverseRadiusSquared) {
+    float distanceSquare = dot(posToLight, posToLight);
+    float factor = distanceSquare * inverseRadiusSquared;
     float smoothFactor = saturate(1.0 - factor * factor);
     float attenuation = smoothFactor * smoothFactor;
     return attenuation * 1.0 / max(distanceSquare, 1e-4);
@@ -201,12 +240,12 @@ vec3 fresnel(vec3 f0, float LoH) {
 // Cook-Torrance approximation of the microfacet model integration using Fresnel law F to model f_m
 // f_r(v,l) = { D(h,α) G(v,l,α) F(v,h,f0) } / { 4 (n⋅v) (n⋅l) }
 vec3 specular(vec3 f0, float roughness, const vec3 h, float NoV, float NoL,
-              float NoH, float LoH, float specularIntensity) {
+              float NoH, float LoH) {
     float D = D_GGX(roughness, NoH, h);
     float V = V_SmithGGXCorrelated(roughness, NoV, NoL);
     vec3 F = fresnel(f0, LoH);
 
-    return (specularIntensity * D * V) * F;
+    return (D * V) * F;
 }
 
 // Diffuse BRDF
@@ -283,84 +322,47 @@ vec3 reinhard_extended_luminance(vec3 color, float max_white_l) {
     return change_luminance(color, l_new);
 }
 
-vec3 point_light(PointLight light, float roughness, float NdotV, vec3 N, vec3 V, vec3 R, vec3 F0, vec3 diffuseColor) {
-    vec3 light_to_frag = light.pos.xyz - v_WorldPosition.xyz;
-    float distance_square = dot(light_to_frag, light_to_frag);
-    float rangeAttenuation =
-        getDistanceAttenuation(distance_square, light.lightParams.r);
-
-    // Specular.
-    // Representative Point Area Lights.
-    // see http://blog.selfshadow.com/publications/s2013-shading-course/karis/s2013_pbs_epic_notes_v2.pdf p14-16
-    float a = roughness;
-    float radius = light.lightParams.g;
-    vec3 centerToRay = dot(light_to_frag, R) * R - light_to_frag;
-    vec3 closestPoint = light_to_frag + centerToRay * saturate(radius * inversesqrt(dot(centerToRay, centerToRay)));
-    float LspecLengthInverse = inversesqrt(dot(closestPoint, closestPoint));
-    float normalizationFactor = a / saturate(a + (radius * 0.5 * LspecLengthInverse));
-    float specularIntensity = normalizationFactor * normalizationFactor;
-
-    vec3 L = closestPoint * LspecLengthInverse; // normalize() equivalent?
-    vec3 H = normalize(L + V);
-    float NoL = saturate(dot(N, L));
-    float NoH = saturate(dot(N, H));
-    float LoH = saturate(dot(L, H));
-
-    vec3 specular = specular(F0, roughness, H, NdotV, NoL, NoH, LoH, specularIntensity);
-
-    // Diffuse.
-    // Comes after specular since its NoL is used in the lighting equation.
-    L = normalize(light_to_frag);
-    H = normalize(L + V);
-    NoL = saturate(dot(N, L));
-    NoH = saturate(dot(N, H));
-    LoH = saturate(dot(L, H));
-
-    vec3 diffuse = diffuseColor * Fd_Burley(roughness, NdotV, NoL, LoH);
-
-    // Lout = f(v,l) Φ / { 4 π d^2 }⟨n⋅l⟩
-    // where
-    // f(v,l) = (f_d(v,l) + f_r(v,l)) * light_color
-    // Φ is light intensity
-
-    // our rangeAttentuation = 1 / d^2 multiplied with an attenuation factor for smoothing at the edge of the non-physical maximum light radius
-    // It's not 100% clear where the 1/4π goes in the derivation, but we follow the filament shader and leave it out
-
-    // See https://google.github.io/filament/Filament.html#mjx-eqn-pointLightLuminanceEquation
-    // TODO compensate for energy loss https://google.github.io/filament/Filament.html#materialsystem/improvingthebrdfs/energylossinspecularreflectance
-    // light.color.rgb is premultiplied with light.intensity on the CPU
-    return ((diffuse + specular) * light.color.rgb) * (rangeAttenuation * NoL);
-}
-
-vec3 dir_light(DirectionalLight light, float roughness, float NdotV, vec3 normal, vec3 view, vec3 R, vec3 F0, vec3 diffuseColor) {
-    vec3 incident_light = light.direction.xyz;
-
-    vec3 half_vector = normalize(incident_light + view);
-    float NoL = saturate(dot(normal, incident_light));
-    float NoH = saturate(dot(normal, half_vector));
-    float LoH = saturate(dot(incident_light, half_vector));
-
-    vec3 diffuse = diffuseColor * Fd_Burley(roughness, NdotV, NoL, LoH);
-    float specularIntensity = 1.0;
-    vec3 specular = specular(F0, roughness, half_vector, NdotV, NoL, NoH, LoH, specularIntensity);
-
-    return (specular + diffuse) * light.color.rgb * NoL;
-}
-
 #endif
+
+highp float rand(vec2 co)
+{
+    highp float a = 12.9898;
+    highp float b = 78.233;
+    highp float c = 43758.5453;
+    highp float dt= dot(co.xy ,vec2(a,b));
+    highp float sn= mod(dt,3.14);
+    return fract(sin(sn) * c);
+}
+
+float get_fog_factor(float d) {
+    return smoothstep(fog.near, fog.far, d);
+}
 
 void main() {
     vec4 output_color = base_color;
+#ifdef FADEUNIFORM_FADE_IN
+    // alpha is 0 at fade_remaining == fade_duration and 1 at fade_remaining == 0
+    if (rand(gl_FragCoord.xy) > (fade_duration - fade_remaining) / fade_duration) {
+        discard;
+        return;
+    }
+#else
+    // alpha is 1 at fade_remaining == fade_duration and 0 at fade_remaining == 0
+    if (rand(gl_FragCoord.xy) < (fade_duration - fade_remaining) / fade_duration) {
+        discard;
+        return;
+    }
+#endif
 #ifdef STANDARDMATERIAL_BASE_COLOR_TEXTURE
-    output_color *= texture(sampler2D(StandardMaterial_base_color_texture,
-                                      StandardMaterial_base_color_texture_sampler),
+    output_color *= texture(sampler2DArray(StandardMaterial_base_color_texture,
+                                           StandardMaterial_base_color_texture_sampler),
                             v_Uv);
 #endif
 
 #ifndef STANDARDMATERIAL_UNLIT
     // calculate non-linear roughness from linear perceptualRoughness
 #    ifdef STANDARDMATERIAL_METALLIC_ROUGHNESS_TEXTURE
-    vec4 metallic_roughness = texture(sampler2D(StandardMaterial_metallic_roughness_texture, StandardMaterial_metallic_roughness_texture_sampler), v_Uv);
+    vec4 metallic_roughness = texture(sampler2DArray(StandardMaterial_metallic_roughness_texture, StandardMaterial_metallic_roughness_texture_sampler), v_Uv);
     // Sampling from GLTF standard channels for now
     float metallic = metallic * metallic_roughness.b;
     float perceptual_roughness = perceptual_roughness * metallic_roughness.g;
@@ -385,11 +387,11 @@ void main() {
 
 #    ifdef STANDARDMATERIAL_NORMAL_MAP
     mat3 TBN = mat3(T, B, N);
-    N = TBN * normalize(texture(sampler2D(StandardMaterial_normal_map, StandardMaterial_normal_map_sampler), v_Uv).rgb * 2.0 - 1.0);
+    N = TBN * normalize(texture(sampler2DArray(StandardMaterial_normal_map, StandardMaterial_normal_map_sampler), v_Uv).rgb * 2.0 - 1.0);
 #    endif
 
 #    ifdef STANDARDMATERIAL_OCCLUSION_TEXTURE
-    float occlusion = texture(sampler2D(StandardMaterial_occlusion_texture, StandardMaterial_occlusion_texture_sampler), v_Uv).r;
+    float occlusion = texture(sampler2DArray(StandardMaterial_occlusion_texture, StandardMaterial_occlusion_texture_sampler), v_Uv).r;
 #    else
     float occlusion = 1.0;
 #    endif
@@ -397,15 +399,10 @@ void main() {
 #    ifdef STANDARDMATERIAL_EMISSIVE_TEXTURE
     vec4 emissive = emissive;
     // TODO use .a for exposure compensation in HDR
-    emissive.rgb *= texture(sampler2D(StandardMaterial_emissive_texture, StandardMaterial_emissive_texture_sampler), v_Uv).rgb;
+    emissive.rgb *= texture(sampler2DArray(StandardMaterial_emissive_texture, StandardMaterial_emissive_texture_sampler), v_Uv).rgb;
 #    endif
 
-    vec3 V;
-    if (ViewProj[3][3] != 1.0) { // If the projection is not orthographic
-        V = normalize(CameraPos.xyz - v_WorldPosition.xyz); // Only valid for a perpective projection
-    } else {
-        V = normalize(vec3(-ViewProj[0][2],-ViewProj[1][2],-ViewProj[2][2])); // Ortho view vec
-    }
+    vec3 V = normalize(CameraPos.xyz - v_WorldPosition.xyz);
     // Neubelt and Pettineo 2013, "Crafting a Next-gen Material Pipeline for The Order: 1886"
     float NdotV = max(dot(N, V), 1e-4);
 
@@ -416,15 +413,38 @@ void main() {
     // Diffuse strength inversely related to metallicity
     vec3 diffuseColor = output_color.rgb * (1.0 - metallic);
 
-    vec3 R = reflect(-V, N);
-
     // accumulate color
     vec3 light_accum = vec3(0.0);
-    for (int i = 0; i < int(NumLights.x) && i < MAX_POINT_LIGHTS; ++i) {
-        light_accum += point_light(PointLights[i], roughness, NdotV, N, V, R, F0, diffuseColor);
-    }
-    for (int i = 0; i < int(NumLights.y) && i < MAX_DIRECTIONAL_LIGHTS; ++i) {
-        light_accum += dir_light(DirectionalLights[i], roughness, NdotV, N, V, R, F0, diffuseColor);
+    for (int i = 0; i < int(NumLights.x) && i < MAX_LIGHTS; ++i) {
+        Light light = SceneLights[i];
+
+        vec3 lightDir = light.pos.xyz - v_WorldPosition.xyz;
+        vec3 L = normalize(lightDir);
+
+        float rangeAttenuation =
+            getDistanceAttenuation(lightDir, light.pos.w);
+
+        vec3 H = normalize(L + V);
+        float NoL = saturate(dot(N, L));
+        float NoH = saturate(dot(N, H));
+        float LoH = saturate(dot(L, H));
+
+        vec3 specular = specular(F0, roughness, H, NdotV, NoL, NoH, LoH);
+        vec3 diffuse = diffuseColor * Fd_Burley(roughness, NdotV, NoL, LoH);
+
+        // Lout = f(v,l) Φ / { 4 π d^2 }⟨n⋅l⟩
+        // where
+        // f(v,l) = (f_d(v,l) + f_r(v,l)) * light_color
+        // Φ is light intensity
+
+        // our rangeAttentuation = 1 / d^2 multiplied with an attenuation factor for smoothing at the edge of the non-physical maximum light radius
+        // It's not 100% clear where the 1/4π goes in the derivation, but we follow the filament shader and leave it out
+
+        // See https://google.github.io/filament/Filament.html#mjx-eqn-pointLightLuminanceEquation
+        // TODO compensate for energy loss https://google.github.io/filament/Filament.html#materialsystem/improvingthebrdfs/energylossinspecularreflectance
+        // light.color.rgb is premultiplied with light.intensity on the CPU
+        light_accum +=
+            ((diffuse + specular) * light.color.rgb) * (rangeAttenuation * NoL);
     }
 
     vec3 diffuse_ambient = EnvBRDFApprox(diffuseColor, 1.0, NdotV);
@@ -440,6 +460,10 @@ void main() {
     // Not needed with sRGB buffer
     // output_color.rgb = pow(output_color.rgb, vec3(1.0 / 2.2));
 #endif
+
+    // FIXME - use the depth texture?
+    float depth = length(v_WorldPosition.xyz - CameraPos.xyz);
+    output_color = mix(output_color, fog.color, get_fog_factor(depth));
 
     o_Target = output_color;
 }

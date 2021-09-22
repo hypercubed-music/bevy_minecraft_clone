@@ -1,6 +1,7 @@
 use bevy::{input::system::exit_on_esc_system, 
     prelude::*, 
-    diagnostic::{Diagnostics, FrameTimeDiagnosticsPlugin}, };
+    diagnostic::{Diagnostics, FrameTimeDiagnosticsPlugin}, 
+    render::camera::PerspectiveProjection};
 use bevy_prototype_character_controller::{
     controller::{
         BodyTag, CameraTag, CharacterController, CharacterControllerPlugin, HeadTag, Mass, YawTag,
@@ -17,6 +18,10 @@ use bevy_mod_raycast::{RayCastSource, build_rays, update_raycast, RaycastSystem,
 use bevy_frustum_culling::*;
 use bevy_physical_sky::{
     PhysicalSkyCameraTag};
+
+use crate::fog;
+use crate::{RENDER_DISTANCE, CHUNK_WIDTH};
+
 pub struct BlockHighlight;
 
 pub struct CharacterSettings {
@@ -100,6 +105,12 @@ pub fn spawn_character(
                 last_ground_point : -9999.9
             }
         ))
+        .insert(fog::FogConfig {
+            //near: ((RENDER_DISTANCE * CHUNK_WIDTH) - 1) as f32,
+            near: 1.0,
+            far: (RENDER_DISTANCE * CHUNK_WIDTH) as f32,
+            ..Default::default()
+        })
         .id();
     let yaw = commands
         .spawn_bundle((GlobalTransform::identity(), Transform::identity(), YawTag))
@@ -113,6 +124,12 @@ pub fn spawn_character(
                 Quat::IDENTITY,
                 Vec3::new(0.0, character_settings.head_scale, 0.0),
             )),
+            ..Default::default()
+        })
+        .insert(fog::FogConfig {
+            //near: ((RENDER_DISTANCE * CHUNK_WIDTH) - 1) as f32,
+            near: 1.0,
+            far: (RENDER_DISTANCE * CHUNK_WIDTH) as f32,
             ..Default::default()
         })
         .id();
@@ -144,6 +161,10 @@ pub fn spawn_character(
     let camera = commands
         .spawn_bundle(PerspectiveCameraBundle {
             transform: camera_transform,
+            perspective_projection: PerspectiveProjection {
+                far: 5000.0f32,
+                ..Default::default()
+            },
             ..Default::default()
         })
         .insert_bundle((LookDirection::default(), CameraTag))

@@ -16,7 +16,7 @@ use bevy_prototype_character_controller::{
 };
 use bevy_frustum_culling::*;
 use std::time::{Instant};
-use bevy_rapier3d::prelude::*;
+use bevy_rapier3d::{prelude::*, physics::TimestepMode};
 mod player_utils;
 use player_utils::{build_app, controller_to_kinematic, CharacterSettings, FakeKinematicRigidBody, MyRaycastSet, BlockHighlight};
 use itertools::*;
@@ -32,11 +32,14 @@ use rustc_hash::FxHashMap;
 mod shaders;
 mod chunk;
 mod worldgen;
+mod fog;
+mod mesh_fade;
 
 const CHUNK_WIDTH : i32 = 32;
 const CHUNK_WIDTH_U : usize = 32;
 const RENDER_DISTANCE : i32 = 5;
 const RENDER_DISTANCE_VERTICAL : i32 = 3;
+const GRAVITY: [f32; 3] = [0.0, -9.81, 0.0];
 
 type BlockArray = ([[[u8; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]);
 
@@ -68,8 +71,14 @@ fn main() {
     let mut app = App::build();
     build_app(&mut app);
     app.add_plugin(RapierPhysicsPlugin::<NoUserData>::default())
+        .insert_resource(RapierConfiguration {
+            gravity: GRAVITY.into(),
+            timestep_mode: TimestepMode::InterpolatedTimestep,
+            ..Default::default()
+        })
         .add_plugin(BoundingVolumePlugin::<obb::Obb>::default())
         .add_plugin(FrustumCullingPlugin::<obb::Obb>::default())
+        .add_plugin(fog::FogPlugin)
         .insert_resource(CharacterSettings {
             focal_point: -Vec3::Z,     // Relative to head
             follow_offset: Vec3::ZERO, // Relative to head
@@ -110,6 +119,11 @@ fn main() {
         .add_system_set(SystemSet::on_update(AppState::Run).with_system(chunk_despawn_system.system()))
         .add_system_set(SystemSet::on_update(AppState::Run).with_system(handle_mouse.system().label("mouse")))
         .add_system_set(SystemSet::on_update(AppState::Run).with_system(updateChunks.system().after("mouse")))
+        .add_system_set(SystemSet::on_update(AppState::Run).with_system(mesh_fade::mesh_fade_update_system.system()))
+        .add_system_to_stage(
+            CoreStage::PostUpdate,
+            shader_defs_system::<mesh_fade::FadeUniform>.system(),
+        )
         .run();
 }
 
@@ -135,13 +149,18 @@ fn check_loaded(
             ..Default::default()
         };
         texture.reinterpret_stacked_2d_as_array(chunk::TEXIMG_WIDTH as u32);
-        let material_handle = materials.add(StandardMaterial {
+        /*let material_handle = materials.add(StandardMaterial {
             base_color_texture: Some(handle.0.clone()),
             metallic: 0.0,
             roughness: 1.0,
             reflectance: 0.0,
             ..Default::default()
-        });
+        });*/
+        let mut material = StandardMaterial::from(handle.0.clone());
+        material.roughness = 1.0;
+        material.metallic = 0.0;
+        material.reflectance = 0.0;
+        let material_handle = materials.add(material);
         commands.insert_resource(ArrayTextureMaterial(material_handle));
         state.set(AppState::Run).unwrap();
     }
@@ -174,15 +193,15 @@ fn setup(
     mut pipelines: ResMut<Assets<PipelineDescriptor>>,
     mut shaders: ResMut<Assets<Shader>>,
     mut ambient_light: ResMut<AmbientLight>,
+    mut render_graph: ResMut<RenderGraph>,
 ) {
-    //let texture_handle = asset_server.load("atlas.png");
-    /*let texture = textures.get_mut(texture_handle.clone()).unwrap();
-    texture.sampler = SamplerDescriptor {
-        address_mode_u: AddressMode::Repeat,
-        address_mode_v: AddressMode::Repeat,
-        ..Default::default()
-    };
-    texture.reinterpret_stacked_2d_as_array(chunk::TEXIMG_WIDTH as u32);*/
+    render_graph.add_system_node(
+        "fade_uniform",
+        RenderResourcesNode::<mesh_fade::FadeUniform>::new(true),
+    );
+    render_graph
+        .add_node_edge("fade_uniform", base::node::MAIN_PASS)
+        .expect("Failed to add fade_uniform as dependency of main pass");
 
     // Create a new shader pipeline
     let pipeline = pipelines.add(PipelineDescriptor::default_config(ShaderStages {
@@ -282,7 +301,7 @@ fn setup(
     commands
         .spawn_bundle(MeshBundle {
             mesh: meshes.add(Mesh::from(bevy::prelude::shape::Icosphere {
-                radius: 1000.0,
+                radius: 4900.0,
                 subdivisions: 5,
             })),
             render_pipelines: RenderPipelines::from_pipelines(vec![RenderPipeline::new(pipeline)]),
@@ -404,17 +423,6 @@ fn handle_tasks(
     array_texture_pipelines: Res<ArrayTexturePipelines>,
     array_texture_material: Res<ArrayTextureMaterial>,
 ) {
-    //let texture = textures.get_mut(texture_handle.clone()).unwrap();
-    //let pipeline = RenderPipelines::from_pipelines(vec![RenderPipeline::new(game_state.pipeline_handle.clone())]);
-    // Set the texture to tile over the entire quad
-    /*texture.sampler = SamplerDescriptor {
-        address_mode_u: AddressMode::Repeat,
-        address_mode_v: AddressMode::Repeat,
-        ..Default::default()
-    };*/
-
-    //texture.reinterpret_stacked_2d_as_array(chunk::TEXIMG_WIDTH as u32);
-    let timer = Instant::now();
     for (entity, mut task) in transform_tasks.iter_mut() {
         if let Some((blocks, chunk_pos)) = future::block_on(future::poll_once(&mut *task)) {
             //Find chunk if it still exists
@@ -427,17 +435,18 @@ fn handle_tasks(
                     chunk.blocks.set_blocks(b);
                 }
                 // Add the mesh and collider to our tagged entity
+                //if let Some((new_mesh, new_collider)) = chunk.blocks.render_new() {
                 if let Some((new_mesh, new_collider)) = chunk.blocks.render_new() {
-                    //let texture_handle = asset_server.load("atlas.png");
-                    /*let chunk_id = commands.entity(entity).insert_bundle(PbrBundle {
-                        mesh: meshes.add(new_mesh),
-                        material: material_handle,
-                        ..Default::default()
-                    })*/
                     let chunk_id = commands.entity(entity).insert_bundle(PbrBundle {
                         mesh: meshes.add(new_mesh),
                         render_pipelines: array_texture_pipelines.0.clone(),
                         material: array_texture_material.0.clone(),
+                        ..Default::default()
+                    })
+                    .insert(mesh_fade::FADE_IN)
+                    .insert(fog::FogConfig {
+                        near: ((RENDER_DISTANCE * CHUNK_WIDTH) - 2) as f32,
+                        far: (RENDER_DISTANCE * CHUNK_WIDTH) as f32,
                         ..Default::default()
                     })
                     .insert(obb::Obb::default())
@@ -461,13 +470,11 @@ fn handle_tasks(
 fn chunk_despawn_system(
     mut game_state: ResMut<Game>,
     mut commands: Commands,
-    thread_pool: Res<AsyncComputeTaskPool>,
     mut transform_query: Query<
         &mut Transform,
         (With<BodyTag>, With<FakeKinematicRigidBody>),
     >,
 ) {
-    let timer = Instant::now();
     // Check for chunks to remove
     let transform = transform_query.single_mut().expect("THERE CAN ONLY BE ONE");
     // generate possible chunk positions
@@ -514,6 +521,9 @@ fn updateChunks(
     array_texture_material: Res<ArrayTextureMaterial>,
 ) {
     let block_change_queue = game_state.block_change_queue.clone();
+    if block_change_queue.len() > 0 {
+        println!("Updating {} chunks", block_change_queue.len());
+    }
     for (chunk_pos, block_pos, id) in block_change_queue.iter() {
         //let idx = game_state.current_chunks.iter().position(|x| x == chunk_pos).unwrap();
         //let chunk = &mut game_state.chunks[idx];
@@ -524,6 +534,8 @@ fn updateChunks(
         chunk.blocks.setBlock(*block_pos, *id);
         //let mut new_chunk_collider : Option<Entity> = None;
         if let Some(chunk_id) = chunk.entity {
+            println!("updating mesh");
+            //if let Some((new_mesh, new_collider)) = chunk.blocks.render_new() {
             if let Some((new_mesh, new_collider)) = chunk.blocks.render_new() {
                 let mut chunk_mesh = chunk_mesh_query.get_mut(chunk_id).unwrap();
                 *chunk_mesh = meshes.add(new_mesh);
@@ -535,13 +547,20 @@ fn updateChunks(
                     chunk.collider = Some(chunk_collider_id);
                 }
             }
-            
         } else  {
+            //if let Some((new_mesh, new_collider)) = chunk.blocks.render_new() {
             if let Some((new_mesh, new_collider)) = chunk.blocks.render_new() {
+                println!("new mesh");
                 let chunk_id = commands.spawn_bundle(PbrBundle {
                     mesh: meshes.add(new_mesh),
                     render_pipelines: array_texture_pipelines.0.clone(),
                     material: array_texture_material.0.clone(),
+                    ..Default::default()
+                })
+                //.insert(mesh_fade::FADE_IN)
+                .insert(fog::FogConfig {
+                    near: ((RENDER_DISTANCE * CHUNK_WIDTH) - 2) as f32,
+                    far: (RENDER_DISTANCE * CHUNK_WIDTH) as f32,
                     ..Default::default()
                 })
                 .insert(obb::Obb::default())
@@ -576,6 +595,7 @@ fn handle_mouse(
             highlight_vis.is_visible = true;
             highlight_pos.translation = Vec3::new(look_block[0] as f32 + 0.5, look_block[1] as f32 + 0.5, look_block[2] as f32 + 0.5);
             if buttons.just_pressed(MouseButton::Right) && distance > 5.0 {
+                println!("Mouse right click");
                 let new_block_pos = [(look_block[0] as f32 + normal.x.floor()) as i32, 
                     (look_block[1] as f32 + normal.y.floor()) as i32, 
                     (look_block[2] as f32 + normal.z.floor()) as i32];
@@ -601,6 +621,7 @@ fn handle_mouse(
                     game_state.block_change_queue.push(([mouse_chunk[0] - 1, mouse_chunk[1], mouse_chunk[2]],[rel_block_pos[0], rel_block_pos[1], 0],1));
                 }
             } else if buttons.just_pressed(MouseButton::Left) {
+                println!("Mouse left click");
                 // add block
                 let mouse_chunk = [((look_block[0] as f32 - 1.0) / float_chunk_width).floor() as i32, 
                     ((look_block[1] as f32 - 1.0) / float_chunk_width).floor() as i32,

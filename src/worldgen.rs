@@ -6,8 +6,9 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
 use building_blocks::storage::prelude::*;
 
-const CHUNK_WIDTH:i32 = 32;
-const CHUNK_WIDTH_U:usize = 32;
+//const CHUNK_WIDTH:i32 = 32;
+//const CHUNK_WIDTH_U:usize = 32;
+use crate::{CHUNK_WIDTH_U, CHUNK_WIDTH};
 
 type BlockArray = ([[[u8; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]; CHUNK_WIDTH_U + 2]);
 
@@ -50,13 +51,13 @@ impl Structure for TreeGen {
             let dy = y - (y_pos+height+1);
             let dz = z - z_pos;
             if (dx * dx) + (dy * dy) + (dz * dz) < 9 {
-                tree_points.push((x, y, z, 34));
+                tree_points.push((x, y, z, 5));
             }
         }
         // trunk 
         
         for y in y_pos..y_pos+height {
-            tree_points.push((x_pos, y, z_pos, 75));
+            tree_points.push((x_pos, y, z_pos, 4));
         }
 
         tree_points
@@ -80,13 +81,13 @@ impl Structure for PineTreeGen {
             let dx = x - x_pos;
             let dz = z - z_pos;
             if (dx * dx) + (dz * dz) < rad as i32 {
-                tree_points.push((x, y, z, 34));
+                tree_points.push((x, y, z, 5));
             }
         }
         // trunk
         
         for y in y_pos..y_pos+height {
-            tree_points.push((x_pos, y, z_pos, 75));
+            tree_points.push((x_pos, y, z_pos, 4));
         }
 
         tree_points
@@ -116,7 +117,7 @@ impl ChunkGenerator {
         let (highnoise,_,_) = NoiseBuilder::fbm_2d_offset(start_x as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2, start_z as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2)
             .with_freq(1.0/16.0).with_octaves(5).with_seed((seed+2) as i32).generate();
         let (biomenoise,_,_) = NoiseBuilder::cellular_2d_offset(start_x as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2, start_z as f32, CHUNK_WIDTH_U + (ex_width_usize*2)+2)
-            .with_freq(1.0/64.0).with_return_type(CellReturnType::CellValue).with_seed(seed as i32).generate();
+            .with_freq(1.0/256.0).with_return_type(CellReturnType::CellValue).with_seed(seed as i32).generate();
         let mut heightmap : Vec<i32> = Vec::new();
         let mut biomemap : Vec<i32> = Vec::new();
         let mut cavemap : Vec<bool> = Vec::new();
@@ -251,11 +252,11 @@ impl ChunkGenerator {
                     let is_not_cave = self.cavemap[((z + self.map_extra_width+1) * (map_size * map_size) + (x + self.map_extra_width+1) * map_size + (y + self.map_extra_width+1)) as usize];
                     if is_not_cave && abs_y < height {
                         blockIDs[x as usize][y as usize][z as usize] = if abs_y == height - 1 {
-                            5
+                            3
                         } else if abs_y > height - 4 {
-                            10
+                            2
                         } else {
-                            27
+                            1
                         };
                     }
                 }
@@ -266,9 +267,9 @@ impl ChunkGenerator {
                     let is_not_cave = self.cavemap[((z + self.map_extra_width+1) * (map_size * map_size) + (x + self.map_extra_width+1) * map_size + (y + self.map_extra_width+1)) as usize];
                     if is_not_cave && abs_y < height {
                         blockIDs[x as usize][y as usize][z as usize] = if abs_y > height - 4 {
-                            49
+                            7
                         } else {
-                            27
+                            1
                         };
                     }
                 }
@@ -279,11 +280,11 @@ impl ChunkGenerator {
                     let is_not_cave = self.cavemap[((z + self.map_extra_width+1) * (map_size * map_size) + (x + self.map_extra_width+1) * map_size + (y + self.map_extra_width+1)) as usize];
                     if is_not_cave && abs_y < height {
                         blockIDs[x as usize][y as usize][z as usize] = if abs_y == height - 1 {
-                            50
+                            6
                         } else if abs_y > height - 4 {
-                            10
+                            2
                         } else {
-                            27
+                            1
                         };
                     }
                 }
